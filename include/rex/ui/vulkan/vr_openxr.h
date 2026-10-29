@@ -120,6 +120,17 @@ uint64_t GameSwapCount();
 void SetFrameInterpolation(uint64_t frame, double state, float t);
 bool FrameInterpolation(uint64_t frame, double& state, float& t);
 
+/// A renderer that draws the game's frames itself (not the xenos GPU thread: plume). At the frame's present, on the
+/// thread that drew it: the pose its camera was read with (NoteCameraPose's since the last call; false: none, a 2D
+/// frame).
+bool TakeCameraPose(float (&pose)[16], float (&tangents)[4]);
+/// Before BeginFrame for that frame: the pose it was drawn with (OnGpuSwap's part for xenos).
+void SetPresentPose(bool posed, const float (&pose)[16], const float (&tangents)[4]);
+/// The finished picture in `image` (`layers` layers: 2, an eye each, or 1 for both), each eye's to its half of screen
+/// image `screen`; `image` left in `layout`.
+void RecordLayeredFrameCopy(VkCommandBuffer command_buffer, VkImage image, VkImageLayout layout, uint32_t width,
+                            uint32_t height, int screen, uint32_t layers);
+
 /// The GPU thread, each swap packet (IssueSwap): the pose of the frame it presents, matched by its frontbuffer (by
 /// order alone a swap queued at start without a packet left every later frame with the previous frame's pose: the
 /// world moved when the head turned).

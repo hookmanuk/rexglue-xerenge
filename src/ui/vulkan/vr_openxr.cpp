@@ -1723,6 +1723,57 @@ void RecordFrameCopy(VkCommandBuffer cmd, VkImage image, VkImageLayout layout, u
           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
+void RecordLayeredFrameCopy(VkCommandBuffer cmd, VkImage image, VkImageLayout layout, uint32_t width, uint32_t height,
+                            int screen, uint32_t layers) {
+  if (screen < 0 || screen >= int(State::kScreens) || !g.screen_images[screen]) {
+    return;
+  }
+  const VkImage target = g.screen_images[screen];
+  const uint32_t eyes = Stereo() ? 2 : 1;
+  const uint32_t out_width = g.screen_width / eyes, out_height = g.screen_height;
+  const bool scaled = out_width != width || out_height != height;
+  VkImageMemoryBarrier barriers[2] = {{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}, {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER}};
+  barriers[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  barriers[0].oldLayout = layout;
+  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].image = image;
+  barriers[0].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].image = target;
+  barriers[1].subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+  for (auto& b : barriers) {
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  }
+  g.vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                            nullptr, 2, barriers);
+  for (uint32_t eye = 0; eye < eyes; ++eye) {
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, std::min(eye, layers - 1), 1};
+    blit.srcOffsets[1] = {int32_t(width), int32_t(height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[0] = {int32_t(eye * out_width), 0, 0};
+    blit.dstOffsets[1] = {int32_t((eye + 1) * out_width), int32_t(out_height), 1};
+    g.vk.vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        1, &blit, scaled ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+  }
+  Barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  VkImageMemoryBarrier back{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  back.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+  back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  back.newLayout = layout;
+  back.srcQueueFamilyIndex = back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  back.image = image;
+  back.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers};
+  g.vk.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+                            nullptr, 1, &back);
+}
+
 bool TakeFrameSignal(VkSemaphore& semaphore, uint64_t& value) {
   if (!g.pending.valid) {
     return false;
@@ -1890,6 +1941,26 @@ std::array<FrameInterpolationEntry, 64> g_interpolation;
 void SetFrameInterpolation(uint64_t frame, double state, float t) {
   std::scoped_lock lock{g_interpolation_mutex};
   g_interpolation[frame % g_interpolation.size()] = {frame, state, t};
+}
+
+bool TakeCameraPose(float (&pose)[16], float (&tangents)[4]) {
+  std::scoped_lock lock{g.camera_mutex};
+  if (!g.camera_posed) {
+    return false;
+  }
+  std::memcpy(pose, g.camera_pose, sizeof(pose));
+  std::memcpy(tangents, g.camera_tangents, sizeof(tangents));
+  g.camera_posed = false;
+  return true;
+}
+
+void SetPresentPose(bool posed, const float (&pose)[16], const float (&tangents)[4]) {
+  std::scoped_lock lock{g.pose_mutex};
+  g.gpu_pose.posed = posed;
+  if (posed) {
+    std::memcpy(g.gpu_pose.pose, pose, sizeof(g.gpu_pose.pose));
+    std::memcpy(g.gpu_pose.tangents, tangents, sizeof(g.gpu_pose.tangents));
+  }
 }
 
 bool FrameInterpolation(uint64_t frame, double& state, float& t) {
