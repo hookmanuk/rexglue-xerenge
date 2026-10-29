@@ -13,6 +13,12 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -214,6 +220,84 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
   return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
+namespace {
+
+// VR fork, development (MCLA_PAD_FILE=<file>): player one's pad from a text file, re-read every 50 ms, merged
+// over the real pads: button names (a b x y start back lb rb ls rs up down left right), lt / rt (fully pressed),
+// and lx= ly= rx= ry= (-1..1). Scripted runs drive the game without keys sent to the foreground window.
+bool PadFileState(X_INPUT_GAMEPAD& pad) {
+  static const char* path = std::getenv("MCLA_PAD_FILE");
+  if (!path || !*path) {
+    return false;
+  }
+  static std::mutex mutex;
+  static uint64_t last_read = 0;
+  static std::string text;
+  std::scoped_lock lock{mutex};
+  const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+  if (now - last_read >= 50) {
+    last_read = now;
+    text.clear();
+    if (FILE* f = std::fopen(path, "rb")) {
+      char buffer[512];
+      const size_t n = std::fread(buffer, 1, sizeof(buffer) - 1, f);
+      std::fclose(f);
+      text.assign(buffer, n);
+    }
+  }
+  static const struct {
+    const char* name;
+    uint16_t bit;
+  } kButtons[] = {{"a", X_INPUT_GAMEPAD_A},           {"b", X_INPUT_GAMEPAD_B},
+                  {"x", X_INPUT_GAMEPAD_X},           {"y", X_INPUT_GAMEPAD_Y},
+                  {"start", X_INPUT_GAMEPAD_START},   {"back", X_INPUT_GAMEPAD_BACK},
+                  {"lb", X_INPUT_GAMEPAD_LEFT_SHOULDER}, {"rb", X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+                  {"ls", X_INPUT_GAMEPAD_LEFT_THUMB}, {"rs", X_INPUT_GAMEPAD_RIGHT_THUMB},
+                  {"up", X_INPUT_GAMEPAD_DPAD_UP},    {"down", X_INPUT_GAMEPAD_DPAD_DOWN},
+                  {"left", X_INPUT_GAMEPAD_DPAD_LEFT}, {"right", X_INPUT_GAMEPAD_DPAD_RIGHT}};
+  uint16_t buttons = 0;
+  bool any = false;
+  size_t at = 0;
+  while (at < text.size()) {
+    const size_t end = text.find_first_of(" \t\r\n,;", at);
+    const std::string token = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    at = end == std::string::npos ? text.size() : end + 1;
+    if (token.empty()) {
+      continue;
+    }
+    any = true;
+    for (const auto& b : kButtons) {
+      if (token == b.name) {
+        buttons |= b.bit;
+      }
+    }
+    if (token == "lt") {
+      pad.left_trigger = 255;
+    } else if (token == "rt") {
+      pad.right_trigger = 255;
+    } else if (token.size() > 3 && token[2] == '=') {
+      const float v = std::clamp(float(std::atof(token.c_str() + 3)), -1.f, 1.f);
+      const int16_t axis = int16_t(v * 32767.f);
+      const std::string name = token.substr(0, 2);
+      if (name == "lx") pad.thumb_lx = axis;
+      if (name == "ly") pad.thumb_ly = axis;
+      if (name == "rx") pad.thumb_rx = axis;
+      if (name == "ry") pad.thumb_ry = axis;
+    }
+  }
+  pad.buttons = uint16_t(uint16_t(pad.buttons) | buttons);
+  return any || path;
+}
+
+}  // namespace
+
+namespace {
+void (*button_pressed_hook)(uint16_t button) = nullptr;
+}  // namespace
+
+void SetButtonPressedHook(void (*hook)(uint16_t button)) { button_pressed_hook = hook; }
+
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
@@ -254,6 +338,22 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     }
   }
 
+  if (user_index == 0 && PadFileState(merged.gamepad)) {  // VR fork: development
+    static uint32_t packet = 0;
+    merged.packet_number = ++packet;
+    any = true;
+  }
+  if (user_index == 0) {  // VR fork: buttons going down (SetButtonPressedHook)
+    static uint16_t buttons_were = 0;
+    const uint16_t buttons = any ? uint16_t(merged.gamepad.buttons) : 0;
+    const uint16_t pressed = buttons & ~buttons_were;
+    buttons_were = buttons;
+    for (uint16_t bit = 1; pressed && button_pressed_hook && bit; bit <<= 1) {
+      if (pressed & bit) {
+        button_pressed_hook(bit);
+      }
+    }
+  }
   if (!any) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }

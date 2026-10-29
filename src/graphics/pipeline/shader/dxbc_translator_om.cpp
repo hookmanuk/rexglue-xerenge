@@ -1542,6 +1542,33 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToRTVs() {
       continue;
     }
     uint32_t system_temp_color = system_temps_color_[i];
+    // MCLA (lighting work): MIN / MAX blending with the SrcAlpha source factor - the host
+    // ignores blend factors in those equations, the Xenos does not (see the flags' note).
+    // gamma_temp.y = the alpha as the blender takes it, saturated.
+    a_.OpAnd(dxbc::Dest::R(gamma_temp, 0b0001), LoadFlagsSystemConstant(),
+             dxbc::Src::LU((kSysFlag_MinMaxColor0TimesSrcAlpha | kSysFlag_MinMaxAlpha0TimesSrcAlpha)
+                           << i));
+    a_.OpIf(true, dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
+    {
+      a_.OpMax(dxbc::Dest::R(gamma_temp, 0b0010),
+               dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW), dxbc::Src::LF(0.0f));
+      a_.OpMin(dxbc::Dest::R(gamma_temp, 0b0010), dxbc::Src::R(gamma_temp, dxbc::Src::kYYYY),
+               dxbc::Src::LF(1.0f));
+      a_.OpAnd(dxbc::Dest::R(gamma_temp, 0b0001), LoadFlagsSystemConstant(),
+               dxbc::Src::LU(kSysFlag_MinMaxColor0TimesSrcAlpha << i));
+      a_.OpIf(true, dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
+      a_.OpMul(dxbc::Dest::R(system_temp_color, 0b0111), dxbc::Src::R(system_temp_color),
+               dxbc::Src::R(gamma_temp, dxbc::Src::kYYYY));
+      a_.OpEndIf();
+      a_.OpAnd(dxbc::Dest::R(gamma_temp, 0b0001), LoadFlagsSystemConstant(),
+               dxbc::Src::LU(kSysFlag_MinMaxAlpha0TimesSrcAlpha << i));
+      a_.OpIf(true, dxbc::Src::R(gamma_temp, dxbc::Src::kXXXX));
+      a_.OpMul(dxbc::Dest::R(system_temp_color, 0b1000),
+               dxbc::Src::R(system_temp_color, dxbc::Src::kWWWW),
+               dxbc::Src::R(gamma_temp, dxbc::Src::kYYYY));
+      a_.OpEndIf();
+    }
+    a_.OpEndIf();
     // Apply the exponent bias after alpha to coverage because it needs the
     // unbiased alpha from the shader.
     a_.OpMul(dxbc::Dest::R(system_temp_color), dxbc::Src::R(system_temp_color),

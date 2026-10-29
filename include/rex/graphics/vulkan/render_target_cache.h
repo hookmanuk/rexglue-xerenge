@@ -32,6 +32,31 @@ class VulkanCommandProcessor;
 
 class VulkanRenderTargetCache final : public RenderTargetCache {
  public:
+  static bool vr_log_transfers;  // VR fork, development: log the next Update's transfers
+  static bool vr_cutout_off;     // VR fork, development: %TEMP%\mcla_cutout_off exists (A/B in one session)
+  static bool vr_sub_off;        // VR fork, development: %TEMP%\mcla_sub_off exists (no sub-texture direct resolves)
+  // VR fork: the next Update's draw (D3D's clear quad) writes `rect` whole in the targets `targets` (bit 0 depth, 1 + n
+  // colour n): their transfers leave it out when they are the only ones transferred into. nullptr: none.
+  // With the depth target: the depth (0 to 1) and stencil it writes when known (VrNoteClearedTiles).
+  struct VrRect {
+    uint32_t x, y, width, height;  // pixels
+    bool depth_known = false;
+    float depth = 0.f;
+    uint32_t stencil = 0;
+  };
+  void VrSetClearCutout(const VrRect* rect, uint32_t targets) {
+    vr_clear_cutout_valid_ = rect != nullptr;
+    if (rect) {
+      vr_clear_cutout_ = {rect->x, rect->y, rect->width, rect->height};
+      vr_clear_targets_ = targets;
+      vr_clear_depth_known_ = rect->depth_known;
+      vr_clear_depth_ = rect->depth;
+      vr_clear_stencil_ = rect->stencil;
+    }
+  }
+  // VR fork: the transfers held back for a run of clear quads, done (with what they cleared left out) before anything
+  // else uses the render targets: the next other draw, a resolve, the submission's end.
+  void VrFlushPendingTransfers();
   union RenderPassKey {
     struct {
       // If emulating 2x as 4x, this is still 2x for simplicity of using this
@@ -105,6 +130,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.
+  // VR fork: frees the render targets idle for `idle_frames` (owning no EDRAM, unbound): their images, views, sets
+  // and every framebuffer (they name the views). The GPU must be idle; returns the bytes freed.
+  uint64_t VrPruneIdleRenderTargets(uint64_t idle_frames);
+  size_t VrCountIdleRenderTargets(uint64_t idle_frames) const {
+    return vr_pending_ ? 0 : RenderTargetCache::VrCountIdleRenderTargets(idle_frames);
+  }
+
+  // VR fork: the texture image the last Resolve wrote directly, VK_NULL_HANDLE if none (its eye dependency).
+  VkImage VrDirectResolvedImage() const { return vr_direct_resolved_image_; }
+
   bool Resolve(const memory::Memory& memory, VulkanSharedMemory& shared_memory,
                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
                uint32_t& written_length_out);
@@ -115,6 +150,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   RenderPassKey last_update_render_pass_key() const { return last_update_render_pass_key_; }
   VkRenderPass last_update_render_pass() const { return last_update_render_pass_; }
   const Framebuffer* last_update_framebuffer() const { return last_update_framebuffer_; }
+  // VR fork (the HUD split): the current color target 0 (an opaque handle), and a target's image and layout.
+  const void* VrColorTarget0() const { return last_update_accumulated_render_targets()[1]; }
+  static void VrTargetImage(const void* target, VkImage& image, VkImageLayout& layout);
+  // VR fork: the last update's depth target (DLSS's depth), its depth-aspect view and sample count.
+  const void* VrDepthTarget() const { return last_update_accumulated_render_targets()[0]; }
+  static void VrDepthImage(const void* target, VkImage& image, VkImageView& view, VkImageLayout& layout,
+                           uint32_t& samples);
   void GetLastUpdateRenderingAttachments(VkRenderingAttachmentInfo* color_attachments,
                                          uint32_t* color_attachment_count_out,
                                          VkRenderingAttachmentInfo* depth_attachment,
@@ -177,6 +219,23 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   void RequestPixelShaderInterlockBarrier() override;
 
  private:
+  bool vr_clear_cutout_valid_ = false;  // VR fork: VrSetClearCutout
+  Transfer::Rectangle vr_clear_cutout_{};
+  uint32_t vr_clear_targets_ = 0;
+  // VR fork: textures direct resolves wrote whole, and the frame (VrDirectResolve: they keep no memory path).
+  std::unordered_map<const void*, uint64_t> vr_whole_written_;
+  bool vr_clear_depth_known_ = false;
+  float vr_clear_depth_ = 0.f;
+  uint32_t vr_clear_stencil_ = 0;
+  // VR fork: after an Update's transfers: the depth target's tiles a clear quad left holding only its value, or none
+  // when anything else binds it.
+  void VrNoteClearedTiles(RenderTarget* depth_render_target, bool clear_quad, uint32_t surface_pitch);
+  // VR fork: VrFlushPendingTransfers: the first clear quad's targets and transfers, the rectangle cleared so far.
+  bool vr_pending_ = false;
+  RenderTarget* vr_pending_targets_[1 + xenos::kMaxColorRenderTargets] = {};
+  std::vector<Transfer> vr_pending_transfers_[1 + xenos::kMaxColorRenderTargets];
+  Transfer::Rectangle vr_pending_cutout_{};
+
   enum class EdramBufferUsage {
     // There's no need for combined fragment and compute usages.
     // With host render targets, the usual usage sequence is as follows:
@@ -262,6 +321,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       EdramBufferModificationStatus::kUnmodified;
   VkDescriptorPool edram_storage_buffer_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet edram_storage_buffer_descriptor_set_;
+  // VR fork, multiview: both eyes' EDRAM buffers (bindings 0 and 1), for transfers drawing both eyes.
+  VkDescriptorSetLayout vr_layout_storage_buffer_eyes_ = VK_NULL_HANDLE;
+  VkDescriptorPool vr_edram_eyes_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet vr_edram_eyes_set_ = VK_NULL_HANDLE;
 
   VkPipelineLayout resolve_copy_pipeline_layout_ = VK_NULL_HANDLE;
   static const ResolveCopyShaderCode
@@ -378,6 +441,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // 2 sampled images for depth / stencil, 1 sampled image for color.
     size_t descriptor_set_index_transfer_source_;
+
+   public:
+    size_t vr_variant_index_ = SIZE_MAX;  // VR fork: the multiview variant of the transfer source set
+    // VR fork: EDRAM tiles [start, end) of a depth target hold only what clear quads wrote there, the guest value
+    // (24-bit depth << 8 | stencil), since it was last bound for anything else, transferred into or cleared:
+    // transfers out of them become clears (PerformTransfersAndResolveClears). Empty when start == end.
+    uint32_t vr_cleared_start_ = 0, vr_cleared_end_ = 0, vr_cleared_value_ = 0;
+    uint32_t vr_cleared_rect_[4] = {};  // x, y, width, height in pixels: what the clear quads covered so far
+
+   private:
 
     VkPipelineStageFlags current_stage_mask_ = 0;
     VkAccessFlags current_access_mask_ = 0;
@@ -870,6 +943,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // VR fork: direct resolves, a compute from the render target's image into the texture's image (the GLSL and the
+  // variants in the .cpp). Pipeline layouts: colour source, depth+stencil source.
+  bool VrDirectResolve(const draw_util::ResolveInfo& resolve_info, VulkanTextureCache& texture_cache);
+  VkPipeline VrGetDirectResolvePipeline(uint32_t variant, VulkanTextureCache& texture_cache);
+  VkPipelineLayout vr_direct_pipeline_layouts_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+  std::unordered_map<uint32_t, VkPipeline> vr_direct_pipelines_;
+  std::vector<void*> vr_direct_textures_;  // this resolve's: made up to date once the range is marked resolved
+  bool vr_direct_memory_needed_ = false;   // a texture at the range the direct path could not write
+  VkImage vr_direct_resolved_image_ = VK_NULL_HANDLE;
 
   // For pixel (fragment) shader interlock.
 

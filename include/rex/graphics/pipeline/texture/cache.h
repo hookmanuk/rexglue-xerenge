@@ -275,6 +275,24 @@ class TextureCache {
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
   };
 
+ public:
+  // VR fork: the 2D tiled scaled-resolve texture at the page with this format and 32-aligned size, or null.
+  Texture* VrFindTexture2D(uint32_t base_page, xenos::TextureFormat format, uint32_t width_aligned,
+                           uint32_t height_aligned);
+  // VR fork, development: the textures at the page (format, size, flags), for the fallback log.
+  std::string VrDescribeTexturesAt(uint32_t base_page) const;
+  uint64_t VrTexturesBytes() const { return textures_total_host_memory_usage_; }  // VR fork, development
+  // VR fork: every texture whose base or mips start at the page.
+  void VrTexturesAt(uint32_t base_page, std::vector<void*>& textures_out);
+  // VR fork: every texture whose base level holds the address after its first page (a resolve into part of one).
+  void VrTexturesContaining(uint32_t address, std::vector<void*>& textures_out);
+  // VR fork: after a direct resolve wrote the texture's image: no load needed.
+  void VrMakeTextureUpToDate(void* texture) {
+    static_cast<Texture*>(texture)->MakeUpToDateAndWatch(global_critical_region_.Acquire());
+  }
+
+ protected:
+
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):
   //   - Guest data may be stored in a sparsely-allocated buffer, or, in
@@ -604,6 +622,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // VR fork: the textures by the page their base (and their mips) start at, for direct resolves.
+  std::unordered_multimap<uint32_t, Texture*> vr_textures_by_page_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

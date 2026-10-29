@@ -293,7 +293,9 @@ uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
           }
         }
       }
-      if (estimate_vertex_max_y) {
+      // VR fork: only D3D's clear quad (its vertex shader): MCLA with shadows off draws many other small unclipped
+      // draws with the 8192 scissor, and running the shader on the CPU for each cost a third of its frame rate.
+      if (estimate_vertex_max_y && vertex_shader.ucode_data_hash() == 0x1E6883FCCDE1F688ull) {
         max_y = std::min(max_y, EstimateVertexMaxY(vertex_shader));
       }
     }

@@ -47,6 +47,9 @@ set(REXUI_VULKAN_SOURCES
     vulkan/vulkan_submission_tracker.cpp
     vulkan/vulkan_upload_buffer_pool.cpp
     vulkan/vulkan_util.cpp
+    vulkan/vr_dlss.cpp
+    vulkan/vr_openxr.cpp
+    vulkan/vr_twins.cpp
 )
 
 # D3D12 UI backend
@@ -110,6 +113,7 @@ target_include_directories(rexui PRIVATE
     ${PROJECT_BINARY_DIR}/include  # Generated macOS Vulkan path data
     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+    ${REXGLUE_ROOT}/thirdparty/openxr/include  # VR fork: OpenXR (vr_openxr.cpp)
 )
 
 target_link_libraries(rexui PUBLIC

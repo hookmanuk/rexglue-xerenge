@@ -17,7 +17,15 @@
 #if REX_PLATFORM_MAC
 struct RENDERDOC_API_1_0_0;
 #else
+// renderdoc_app.h only knows Windows and Linux and needs nothing but an empty
+// calling convention from the latter. RenderDoc itself is not available on PS5.
+#if REX_PLATFORM_PS5 && !defined(__linux__)
+#define __linux__ 1
 #include <renderdoc_app.h>
+#undef __linux__
+#else
+#include <renderdoc_app.h>
+#endif
 #endif
 
 namespace rex {

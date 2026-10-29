@@ -11,6 +11,12 @@
 
 #include <cstdlib>
 #include <algorithm>
+#include <bit>
+#include <rex/ui/vulkan/vr_openxr.h>
+#include <rex/ui/vulkan/vr_dlss.h>
+#include <rex/ui/vulkan/vr_twins.h>
+#include <rex/ui/renderdoc_api.h>
+#include <filesystem>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -48,6 +54,12 @@
 #include <rex/ui/vulkan/util.h>
 
 // Legacy backend compatibility aliases for shared readback controls.
+// VR fork: the draw's matrices' registers (VrDrawMatrix).
+REXCVAR_DEFINE_INT32(vr_world_constant, 0, "VR", "Vertex shader register of the draw's world matrix (VR)");
+REXCVAR_DEFINE_INT32(vr_wvp_constant, 8, "VR", "Vertex shader register of the draw's world-view-projection (VR)");
+REXCVAR_DEFINE_BOOL(vr_constants_transposed, false, "VR",
+                    "The world and world-view-projection registers hold the matrices transposed (VR)");
+
 REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -71,6 +83,31 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::vulkan {
+
+// Submissions and blocking fence waits so far, with the time spent in each
+// (microseconds), for performance diagnosis: {submits, submit us, waits, wait us}.
+// (VR fork: from the MCLA SDK's base, which the VR layer's counters use.)
+std::atomic<uint64_t> g_submission_counters[4];
+// Draws issued so far.
+std::atomic<uint64_t> g_draw_counter{0};
+// Of those, the ones that reached the host as a draw.
+std::atomic<uint64_t> g_host_draw_counter{0};
+uint64_t HostDrawCounter() {
+  return g_host_draw_counter.load(std::memory_order_relaxed);
+}
+uint64_t DrawCounter() {
+  return g_draw_counter.load(std::memory_order_relaxed);
+}
+void SubmissionCounters(uint64_t out[4]) {
+  for (int i = 0; i < 4; ++i) {
+    out[i] = g_submission_counters[i].load(std::memory_order_relaxed);
+  }
+}
+static uint64_t CounterNowMicros() {
+  return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count());
+}
 // The diagnostics this fork adds are off unless XERENGE_GPU_TRACE is set: they
 // report per draw and per swap, which floods a normal session's log.
 static bool XerengeTraceEnabled() {
@@ -606,6 +643,14 @@ bool CompileGlslToSpirvInternal(EShLanguage stage, std::string_view source,
 }  // namespace
 
 // Generated with `xb buildshaders`.
+extern std::atomic<uint64_t> g_vr_execute_us;  // VR fork: development timing (IssueSwap's log)
+extern std::atomic<uint64_t> g_vr_gpu_ns;
+extern std::atomic<uint64_t> g_vr_gpu_zone_ns[5];
+extern std::atomic<uint64_t> g_vr_gpu_detail_ns[256];
+extern std::string g_vr_gpu_detail_names[256];
+extern std::mutex g_vr_gpu_detail_mutex;
+extern VulkanCommandProcessor* g_vr_submitting_processor;
+
 namespace shaders {
 #include "../shaders/vulkan_spirv/apply_gamma_pwl_cs.h"
 #include "../shaders/vulkan_spirv/apply_gamma_pwl_fxaa_luma_ps.h"
@@ -619,6 +664,9 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/resolve_downscale_cs.h"
 }  // namespace shaders
 
+const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBufferDynamic = {  // VR fork
+    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, SpirvShaderTranslator::kConstantBufferCount *
+                                                   kLinkedTypeDescriptorPoolSetCount};
 const VkDescriptorPoolSize VulkanCommandProcessor::kDescriptorPoolSizeUniformBuffer = {
     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
     SpirvShaderTranslator::kConstantBufferCount* kLinkedTypeDescriptorPoolSetCount};
@@ -640,6 +688,10 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
           &kDescriptorPoolSizeUniformBuffer, 1, kLinkedTypeDescriptorPoolSetCount),
+      vr_constants_dynamic_allocator_(  // VR fork
+          static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+              ->vulkan_device(),
+          &kDescriptorPoolSizeUniformBufferDynamic, 1, kLinkedTypeDescriptorPoolSetCount),
       transient_descriptor_allocator_storage_buffer_(
           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
               ->vulkan_device(),
@@ -825,7 +877,31 @@ bool VulkanCommandProcessor::CompileGlslToSpirv(VkShaderStageFlagBits stage,
   return CompileGlslToSpirvInternal(glslang_stage, source, spirv_out, error_out);
 }
 
+namespace {
+// VR fork: dynamic constants (MCLA_VR_DYNAMIC_CONSTANTS=0: written per draw, as upstream).
+bool VrDynamicConstantsWanted() {
+  const char* v = std::getenv("MCLA_VR_DYNAMIC_CONSTANTS");
+  return !(v && v[0] == '0');
+}
+// The largest each constant buffer gets: its range in the dynamic descriptor, and the size requested from the pool
+// so a range at any offset stays inside the page.
+VkDeviceSize VrConstantRange(uint32_t buffer) {
+  switch (buffer) {
+    case SpirvShaderTranslator::kConstantBufferSystem:
+      return sizeof(SpirvShaderTranslator::SystemConstants);
+    case SpirvShaderTranslator::kConstantBufferFloatVertex:
+    case SpirvShaderTranslator::kConstantBufferFloatPixel:
+      return sizeof(float) * 4 * 256;
+    case SpirvShaderTranslator::kConstantBufferBoolLoop:
+      return sizeof(uint32_t) * (8 + 32);
+    default:
+      return sizeof(uint32_t) * 6 * 32;
+  }
+}
+}  // namespace
+
 bool VulkanCommandProcessor::SetupContext() {
+  ui::vulkan::vr::SetGpuThread();  // VR fork: the thread whose resources get right-eye twins
   if (!CommandProcessor::SetupContext()) {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
@@ -879,12 +955,14 @@ bool VulkanCommandProcessor::SetupContext() {
     return false;
   }
   // Guest draw constants.
+  vr_dynamic_constants_ = ui::vulkan::vr::Active() && VrDynamicConstantsWanted();  // VR fork
   VkDescriptorSetLayoutBinding
       descriptor_set_layout_bindings_constants[SpirvShaderTranslator::kConstantBufferCount] = {};
   for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
     VkDescriptorSetLayoutBinding& constants_binding = descriptor_set_layout_bindings_constants[i];
     constants_binding.binding = i;
-    constants_binding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    constants_binding.descriptorType =
+        vr_dynamic_constants_ ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     constants_binding.descriptorCount = 1;
     constants_binding.pImmutableSamplers = nullptr;
   }
@@ -974,6 +1052,8 @@ bool VulkanCommandProcessor::SetupContext() {
         "emulator, reducing to {}x{}",
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
+  ui::vulkan::vr::FitDrawResolutionScale(vulkan_device, draw_resolution_scale_x,  // VR fork: or it hangs the PC
+                                         draw_resolution_scale_y);
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
     REXGPU_WARN(
         "Vulkan draw resolution scaling is experimental and may not affect all "
@@ -1027,7 +1107,7 @@ bool VulkanCommandProcessor::SetupContext() {
   // Shared memory and EDRAM descriptor set layout.
   bool edram_fragment_shader_interlock =
       render_target_cache_->GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
-  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[2];
+  VkDescriptorSetLayoutBinding shared_memory_and_edram_descriptor_set_layout_bindings[4];  // VR fork: 4
   shared_memory_and_edram_descriptor_set_layout_bindings[0].binding = 0;
   shared_memory_and_edram_descriptor_set_layout_bindings[0].descriptorType =
       VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -1055,6 +1135,27 @@ bool VulkanCommandProcessor::SetupContext() {
   } else {
     shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount = 1;
   }
+  if (ui::vulkan::vr::Stereo()) {  // VR fork: DLSS's object motion image, binding 2 (the pixel shaders write it)
+    if (shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount == 1) {
+      shared_memory_and_edram_descriptor_set_layout_bindings[1] = {};  // the EDRAM's slot unused
+    }
+    VkDescriptorSetLayoutBinding& motion_binding =
+        shared_memory_and_edram_descriptor_set_layout_bindings
+            [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount];
+    motion_binding.binding = 2;
+    motion_binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    motion_binding.descriptorCount = 1;
+    motion_binding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    motion_binding.pImmutableSamplers = nullptr;
+    ++shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount;
+    if (ui::vulkan::vr::Multiview()) {  // the right eye's, binding 3 (passes drawing both eyes)
+      VkDescriptorSetLayoutBinding& right_binding =
+          shared_memory_and_edram_descriptor_set_layout_bindings
+              [shared_memory_and_edram_descriptor_set_layout_create_info.bindingCount++];
+      right_binding = motion_binding;
+      right_binding.binding = 3;
+    }
+  }
   if (dfn.vkCreateDescriptorSetLayout(
           device, &shared_memory_and_edram_descriptor_set_layout_create_info, nullptr,
           &descriptor_set_layout_shared_memory_and_edram_) != VK_SUCCESS) {
@@ -1081,16 +1182,18 @@ bool VulkanCommandProcessor::SetupContext() {
   }
 
   // Shared memory and EDRAM common bindings.
-  VkDescriptorPoolSize descriptor_pool_sizes[1];
+  VkDescriptorPoolSize descriptor_pool_sizes[2];
   descriptor_pool_sizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   descriptor_pool_sizes[0].descriptorCount =
       shared_memory_binding_count + uint32_t(edram_fragment_shader_interlock);
+  descriptor_pool_sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;  // VR fork: the object motion image
+  descriptor_pool_sizes[1].descriptorCount = ui::vulkan::vr::Multiview() ? 2 : 1;
   VkDescriptorPoolCreateInfo descriptor_pool_create_info;
   descriptor_pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
   descriptor_pool_create_info.pNext = nullptr;
   descriptor_pool_create_info.flags = 0;
   descriptor_pool_create_info.maxSets = 1;
-  descriptor_pool_create_info.poolSizeCount = 1;
+  descriptor_pool_create_info.poolSizeCount = ui::vulkan::vr::Stereo() ? 2 : 1;
   descriptor_pool_create_info.pPoolSizes = descriptor_pool_sizes;
   if (dfn.vkCreateDescriptorPool(device, &descriptor_pool_create_info, nullptr,
                                  &shared_memory_and_edram_descriptor_pool_) != VK_SUCCESS) {
@@ -1154,6 +1257,38 @@ bool VulkanCommandProcessor::SetupContext() {
   }
   dfn.vkUpdateDescriptorSets(device, 1 + uint32_t(edram_fragment_shader_interlock),
                              write_descriptor_sets, 0, nullptr);
+  if (ui::vulkan::vr::Stereo()) {  // VR fork: DLSS's object motion image (the hooks give the right eye a twin)
+    VkImageCreateInfo motion_info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    motion_info.imageType = VK_IMAGE_TYPE_2D;
+    motion_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+    motion_info.extent = {1280 * texture_cache_->draw_resolution_scale_x(),
+                          768 * texture_cache_->draw_resolution_scale_y(), 1};
+    motion_info.mipLevels = motion_info.arrayLayers = 1;
+    motion_info.samples = VK_SAMPLE_COUNT_1_BIT;
+    motion_info.usage = VK_IMAGE_USAGE_STORAGE_BIT;
+    VkImageViewCreateInfo motion_view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    motion_view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    motion_view_info.format = motion_info.format;
+    motion_view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (ui::vulkan::util::CreateDedicatedAllocationImage(vulkan_device, motion_info,
+                                                         ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+                                                         vr_motion_image_, vr_motion_memory_) &&
+        (motion_view_info.image = vr_motion_image_,
+         dfn.vkCreateImageView(device, &motion_view_info, nullptr, &vr_motion_view_) == VK_SUCCESS)) {
+      const VkDescriptorImageInfo motion_image_info[2] = {
+          {VK_NULL_HANDLE, vr_motion_view_, VK_IMAGE_LAYOUT_GENERAL},
+          {VK_NULL_HANDLE, ui::vulkan::vr::TwinViewOf(vr_motion_view_), VK_IMAGE_LAYOUT_GENERAL}};
+      VkWriteDescriptorSet motion_write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      motion_write.dstSet = shared_memory_and_edram_descriptor_set_;
+      motion_write.dstBinding = 2;
+      motion_write.descriptorCount = ui::vulkan::vr::Multiview() ? 2 : 1;  // (multiview: bindings 2, 3)
+      motion_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      motion_write.pImageInfo = motion_image_info;
+      dfn.vkUpdateDescriptorSets(device, 1, &motion_write, 0, nullptr);
+      ui::vulkan::vr::dlss::SetObjectMotionImage(vr_motion_image_, vr_motion_view_, motion_info.extent.width,
+                                                 motion_info.extent.height);
+    }
+  }
 
   // Swap objects.
 
@@ -1949,10 +2084,235 @@ bool VulkanCommandProcessor::SetupContext() {
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
+  // VR fork: the submission thread (VULKAN_ASYNC_SUBMIT=0: submissions stay inline).
+  if (const char* v = std::getenv("VULKAN_ASYNC_SUBMIT"); !(v && v[0] == '0')) {
+    async_submit_ = true;
+    submission_stop_ = false;
+    if (const char* timing = std::getenv("VULKAN_GPU_TIMING"); timing && timing[0] == '1') {
+      const ui::vulkan::VulkanDevice* const timing_device = GetVulkanDevice();
+      VkPhysicalDeviceProperties physical_properties;
+      timing_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+          timing_device->physical_device(), &physical_properties);
+      gpu_timer_ns_per_tick_ = double(physical_properties.limits.timestampPeriod);
+      VkQueryPoolCreateInfo pool_info{};
+      pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+      pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      pool_info.queryCount = kGpuTimerSlots;
+      if (timing_device->functions().vkCreateQueryPool(timing_device->device(), &pool_info, nullptr,
+                                                       &gpu_timer_pool_) != VK_SUCCESS) {
+        gpu_timer_pool_ = VK_NULL_HANDLE;
+      } else {
+        DeferredCommandBuffer::vr_marks_enabled = true;
+        DeferredCommandBuffer::vr_mark_hook = [](VkCommandBuffer command_buffer, uint32_t category) {
+          if (VulkanCommandProcessor* processor = g_vr_submitting_processor) {
+            processor->GpuTimerStamp(command_buffer, category);
+          }
+        };
+      }
+    }
+    submission_thread_ = std::thread([this] { SubmissionThreadMain(); });
+    g_vr_submitting_processor = this;
+    ui::vulkan::VulkanDevice::before_queue_acquire.store(&FlushSubmissionThreadHook);
+  }
+
   return true;
 }
 
+VulkanCommandProcessor* g_vr_submitting_processor = nullptr;  // VR fork: FlushSubmissionThreadHook's
+
+void VulkanCommandProcessor::FlushSubmissionThreadHook() {
+  if (VulkanCommandProcessor* processor = g_vr_submitting_processor) {
+    processor->FlushSubmissionThread();
+  }
+}
+
+void VulkanCommandProcessor::FlushSubmissionThread() {
+  if (!async_submit_) {
+    return;
+  }
+  std::unique_lock lock{submission_mutex_};
+  submission_idle_cv_.wait(lock, [this] { return submission_jobs_.empty() && !submission_busy_; });
+}
+
+uint32_t VulkanCommandProcessor::GpuTimerSlotsInUse() const {
+  if (gpu_timed_.empty()) {
+    return 0;
+  }
+  return (gpu_timer_next_ + kGpuTimerSlots - gpu_timed_.front().first_slot) % kGpuTimerSlots;
+}
+
+void VulkanCommandProcessor::GpuTimerStamp(VkCommandBuffer command_buffer, uint32_t category) {
+  if (!gpu_timing_current_ || command_buffer != gpu_timing_command_buffer_ ||
+      gpu_timing_current_->categories.size() >= 4000) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = GetVulkanDevice()->functions();
+  // Two slots a stamp: inside a multiview render pass (stereo) a timestamp fills one query a view.
+  const uint32_t slot = gpu_timer_next_;
+  gpu_timer_next_ = (gpu_timer_next_ + 2) % kGpuTimerSlots;
+  dfn.vkCmdWriteTimestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, gpu_timer_pool_, slot);
+  gpu_timing_current_->categories.push_back(category);
+}
+
+void VulkanCommandProcessor::GpuTimerCollect(bool all) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  while (!gpu_timed_.empty()) {
+    GpuTimedSubmission& oldest = gpu_timed_.front();
+    const uint32_t count = uint32_t(oldest.categories.size());
+    if (count < 2) {
+      gpu_timed_.pop_front();
+      continue;
+    }
+    std::vector<uint64_t> results(size_t(count) * 2);
+    bool available = true;
+    for (uint32_t i = 0; i < count && available; ++i) {
+      const uint32_t slot = (oldest.first_slot + 2 * i) % kGpuTimerSlots;
+      available = dfn.vkGetQueryPoolResults(vulkan_device->device(), gpu_timer_pool_, slot, 1,
+                                            2 * sizeof(uint64_t), &results[2 * i], 2 * sizeof(uint64_t),
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT) ==
+                      VK_SUCCESS &&
+                  results[2 * i + 1];
+    }
+    if (!available) {
+      return;
+    }
+    for (uint32_t i = 0; i + 1 < count; ++i) {
+      const uint64_t from = results[2 * i], to = results[2 * i + 2];
+      if (to > from) {
+        const uint32_t category = oldest.categories[i];
+        const uint64_t ns = uint64_t(double(to - from) * gpu_timer_ns_per_tick_);
+        if (category >= 16 && category < 16 + 256) {
+          g_vr_gpu_detail_ns[category - 16].fetch_add(ns, std::memory_order_relaxed);
+        }
+        g_vr_gpu_zone_ns[category >= 16 ? 1 : std::min<uint32_t>(category, 4)].fetch_add(ns,
+                                                                                         std::memory_order_relaxed);
+      }
+    }
+    gpu_timed_.pop_front();
+    (void)all;
+  }
+}
+
+bool VulkanCommandProcessor::RunSubmissionJob(SubmissionJob& job) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (dfn.vkResetCommandPool(device, job.command_buffer.pool, 0) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to reset a Vulkan command pool");
+    return false;
+  }
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (dfn.vkBeginCommandBuffer(job.command_buffer.buffer, &begin_info) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+    return false;
+  }
+  // VR fork, development: the GPU time of each submission by kind (timestamps at its start, its marks, its end).
+  const bool timing = gpu_timer_pool_ != VK_NULL_HANDLE;
+  if (timing) {
+    GpuTimerCollect(false);
+    if (GpuTimerSlotsInUse() + 8192 < kGpuTimerSlots) {
+      gpu_timed_.push_back({gpu_timer_next_, {}});
+      // The submission's slots are reset here, outside any render pass (a reset inside one is invalid, and its
+      // timestamp never became available, which stalled the collection).
+      {
+        const uint32_t first = gpu_timer_next_, count = 2 * 4002, head = std::min(count, kGpuTimerSlots - first);
+        dfn.vkCmdResetQueryPool(job.command_buffer.buffer, gpu_timer_pool_, first, head);
+        if (head < count) {
+          dfn.vkCmdResetQueryPool(job.command_buffer.buffer, gpu_timer_pool_, 0, count - head);
+        }
+      }
+      gpu_timing_current_ = &gpu_timed_.back();
+      gpu_timing_command_buffer_ = job.command_buffer.buffer;
+      GpuTimerStamp(job.command_buffer.buffer, 0);
+    }
+  }
+  deferred_command_buffer_.Execute(job.command_buffer.buffer, job.stream);
+  if (gpu_timing_current_) {
+    GpuTimerStamp(job.command_buffer.buffer, 0);
+    gpu_timing_current_ = nullptr;
+  }
+  if (dfn.vkEndCommandBuffer(job.command_buffer.buffer) != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to end a Vulkan command buffer");
+    return false;
+  }
+  VkSubmitInfo submit_info{};
+  submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit_info.waitSemaphoreCount = uint32_t(job.wait_semaphores.size());
+  submit_info.pWaitSemaphores = job.wait_semaphores.empty() ? nullptr : job.wait_semaphores.data();
+  submit_info.pWaitDstStageMask = job.wait_stage_masks.empty() ? nullptr : job.wait_stage_masks.data();
+  submit_info.commandBufferCount = 1;
+  submit_info.pCommandBuffers = &job.command_buffer.buffer;
+  VkTimelineSemaphoreSubmitInfo vr_timeline{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+  if (job.vr_semaphore != VK_NULL_HANDLE) {  // VR fork: the headset's frame is done with this submission
+    vr_timeline.signalSemaphoreValueCount = 1;
+    vr_timeline.pSignalSemaphoreValues = &job.vr_value;
+    submit_info.pNext = &vr_timeline;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &job.vr_semaphore;
+  }
+  VkResult result;
+  {
+    ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+        vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
+    result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, job.fence);
+  }
+  if (result != VK_SUCCESS) {
+    REXGPU_ERROR("Failed to submit a Vulkan command buffer");
+    if (result == VK_ERROR_DEVICE_LOST && !device_lost_) {
+      device_lost_ = true;
+      if (graphics_system_) {
+        graphics_system_->OnHostGpuLossFromAnyThread(true);
+      }
+    }
+    return false;
+  }
+  return true;
+}
+
+void VulkanCommandProcessor::SubmissionThreadMain() {
+  ui::vulkan::VulkanDevice::QueueAcquireExempt() = true;
+  std::unique_lock lock{submission_mutex_};
+  while (true) {
+    submission_cv_.wait(lock, [this] { return submission_stop_ || !submission_jobs_.empty(); });
+    if (submission_jobs_.empty()) {
+      break;  // stopping with nothing left
+    }
+    SubmissionJob job = std::move(submission_jobs_.front());
+    submission_jobs_.pop_front();
+    submission_busy_ = true;
+    lock.unlock();
+    const auto start = std::chrono::steady_clock::now();
+    RunSubmissionJob(job);
+    g_vr_execute_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - start)
+                                           .count()),
+                              std::memory_order_relaxed);
+    lock.lock();
+    submission_free_streams_.push_back(std::move(job.stream));
+    submission_busy_ = false;
+    submitted_submission_.store(job.submission, std::memory_order_release);
+    submission_idle_cv_.notify_all();  // FlushSubmissionThread and the fence checks
+  }
+}
+
 void VulkanCommandProcessor::ShutdownContext() {
+  if (submission_thread_.joinable()) {  // VR fork: the submission thread's last jobs, then the thread
+    FlushSubmissionThread();
+    if (g_vr_submitting_processor == this) {
+      ui::vulkan::VulkanDevice::before_queue_acquire.store(nullptr);
+      g_vr_submitting_processor = nullptr;
+    }
+    {
+      std::scoped_lock lock{submission_mutex_};
+      submission_stop_ = true;
+    }
+    submission_cv_.notify_all();
+    submission_thread_.join();
+    async_submit_ = false;
+  }
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
@@ -2325,11 +2685,463 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
 }
 
+std::atomic<uint64_t> g_vr_execute_us{0};  // VR fork: development timing (EndSubmission's replay and submit)
+std::atomic<uint64_t> g_vr_gpu_ns{0};
+std::atomic<uint64_t> g_vr_gpu_zone_ns[5];  // by VrGpuZone category
+uint64_t g_vr_stencil_draws[2];              // VR fork, development: draws testing, writing stencil
+// VR fork, development: categories from 16 are detail zones (transfers by destination), named by the zone's maker.
+std::atomic<uint64_t> g_vr_gpu_detail_ns[256];
+std::string g_vr_gpu_detail_names[256];
+std::mutex g_vr_gpu_detail_mutex;
+uint32_t VrGpuDetailCategory(const std::string& name) {
+  std::scoped_lock lock{g_vr_gpu_detail_mutex};
+  for (uint32_t i = 0; i < 256; ++i) {
+    if (g_vr_gpu_detail_names[i] == name) {
+      return 16 + i;
+    }
+    if (g_vr_gpu_detail_names[i].empty()) {
+      g_vr_gpu_detail_names[i] = name;
+      return 16 + i;
+    }
+  }
+  return 1;
+}       // VR fork: development timing (submissions' GPU time, VULKAN_GPU_TIMING=1)
+
+// VR fork: the HUD-shader draws of the frame by what VrHudDraw made of them, and the frames by kind; logged every 600
+// frames (development: a HUD draw left out of the split lands in the head-tracked scene, or the frame on the screen).
+struct VrHudStats {
+  uint32_t accepted, other_target, no_scene, no_colour, msaa, pitch, split_failed;  // this frame's HUD-shader draws
+  uint64_t frames, split, scene_not_split, no_scene_hud, before_split_msaa, before_split_pitch, after_other, failed;
+};
+VrHudStats g_vr_hud_stats{};
+
+void VrHudStatsFrame(bool scene, bool split) {
+  VrHudStats& s = g_vr_hud_stats;
+  if (s.frames % 60 == 0) {  // development: the clear cutout switched off while the file exists
+    static const std::filesystem::path off = std::filesystem::temp_directory_path() / "mcla_cutout_off";
+    std::error_code ec;
+    VulkanRenderTargetCache::vr_cutout_off = std::filesystem::exists(off, ec);
+    static const std::filesystem::path sub_off = std::filesystem::temp_directory_path() / "mcla_sub_off";
+    VulkanRenderTargetCache::vr_sub_off = std::filesystem::exists(sub_off, ec);
+  }
+  const uint32_t hud = s.accepted + s.other_target + s.no_scene + s.no_colour + s.msaa + s.pitch + s.split_failed;
+  ++s.frames;
+  s.split += split;
+  s.scene_not_split += scene && !split && hud;
+  s.no_scene_hud += !scene && hud;
+  s.before_split_msaa += scene && s.msaa;
+  s.before_split_pitch += scene && s.pitch;
+  s.after_other += split && s.other_target;
+  s.failed += s.split_failed != 0;
+  s.accepted = s.other_target = s.no_scene = s.no_colour = s.msaa = s.pitch = s.split_failed = 0;
+  if (s.frames % 600 == 0) {
+    extern uint64_t g_vr_clear_reasons[8];
+    extern uint64_t g_vr_clear_stats[8];
+    REXLOG_INFO("VR clears: no cutout (primitive {}, viewport {}, mode {}, depth {}, colour {}, rect {}), cutout {}; "
+                "with transfers {}: held {}, grown {}, not all targets {}; transfers held {} tiles, done {} tiles; "
+                "of cleared tiles as clears {} ({} tiles)",
+                g_vr_clear_reasons[0], g_vr_clear_reasons[5], g_vr_clear_reasons[6], g_vr_clear_reasons[1],
+                g_vr_clear_reasons[2], g_vr_clear_reasons[3],
+                g_vr_clear_reasons[4], g_vr_clear_stats[0], g_vr_clear_stats[1], g_vr_clear_stats[2],
+                g_vr_clear_stats[3], g_vr_clear_stats[4], g_vr_clear_stats[5], g_vr_clear_stats[6],
+                g_vr_clear_stats[7]);
+    std::memset(g_vr_clear_reasons, 0, sizeof(g_vr_clear_reasons));
+    std::memset(g_vr_clear_stats, 0, sizeof(g_vr_clear_stats));
+    REXLOG_INFO("VR HUD: last 600 frames: split {}, scene not split {}, HUD without a scene {}, HUD draws before "
+                "the split into a multisampled target {}, another pitch {}, after the split to another target {}, "
+                "split failed {}",
+                s.split, s.scene_not_split, s.no_scene_hud, s.before_split_msaa, s.before_split_pitch, s.after_other,
+                s.failed);
+    s.split = s.scene_not_split = s.no_scene_hud = s.before_split_msaa = s.before_split_pitch = s.after_other =
+        s.failed = 0;
+  }
+}
+
+// VR fork: whether the draw is the HUD's (its vertex shader: the game's UI movie renderer) into the posed frame's
+// split target; the first one splits the frame (the copy and clear at the draw, after the render pass is entered).
+bool VulkanCommandProcessor::VrHudDraw(const Shader* vertex_shader) {
+  if (!vertex_shader || !ui::vulkan::vr::Active() || !vr_output_width_) {
+    return false;
+  }
+  static const std::vector<uint64_t> hud_shaders = [] {
+    std::vector<uint64_t> hashes = {0x88F617431F7D9C9Bull, 0xAED972BB05F1D549ull};
+    if (const char* extra = std::getenv("MCLA_VR_HUD_VS")) {  // more, comma-separated hex
+      for (const char* p = extra; *p;) {
+        char* end = nullptr;
+        hashes.push_back(std::strtoull(p, &end, 16));
+        p = *end ? end + 1 : end;
+      }
+    }
+    return hashes;
+  }();
+  if (std::find(hud_shaders.begin(), hud_shaders.end(), vertex_shader->ucode_data_hash()) == hud_shaders.end()) {
+    return false;
+  }
+  const RegisterFile& regs = *register_file_;
+  const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+  const auto color0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+  VrHudStats& stats = g_vr_hud_stats;
+  if (vr_hud_screen_ >= 0) {
+    const bool same = color0.color_base == vr_hud_base_ && surface.surface_pitch == vr_hud_pitch_;
+    ++(same ? stats.accepted : stats.other_target);
+    return same;
+  }
+  if (!vr_frame_scene_) {  // no head-tracked scene (a title screen): the frame whole, on the screen
+    ++stats.no_scene;
+    return false;
+  }
+  // The split starts at a HUD draw that writes colour: one that writes none (the title's first ones) may leave the
+  // colour target unbound, and the copy and clear then take a stale target (the title froze to the head, a ghost of
+  // the logo in its sky).
+  if (!(regs[XE_GPU_REG_RB_COLOR_MASK] & 0xF)) {
+    ++stats.no_colour;
+    return false;
+  }
+  if (surface.msaa_samples != xenos::MsaaSamples::k1X || surface.surface_pitch != vr_output_width_) {
+    ++(surface.msaa_samples != xenos::MsaaSamples::k1X ? stats.msaa : stats.pitch);
+    return false;
+  }
+  vr_hud_screen_ = ui::vulkan::vr::SplitFrame(vr_output_width_ * render_target_cache_->draw_resolution_scale_x(),
+                                              vr_output_height_ * render_target_cache_->draw_resolution_scale_y(),
+                                              float(vr_output_height_) / float(vr_output_width_));
+  if (vr_hud_screen_ < 0) {
+    ++stats.split_failed;
+    return false;
+  }
+  ++stats.accepted;
+  vr_hud_copy_pending_ = true;
+  vr_hud_base_ = color0.color_base;
+  vr_hud_pitch_ = surface.surface_pitch;
+  return true;
+}
+
+// VR fork: where the game's vertex shaders keep a draw's world and world-view-projection matrices (four registers
+// each), and whether as the rows of a row-vector matrix (RAGE: MCLA's c0 and c8) or transposed (clip.i = dot(c_i,
+// position): Burnout Revenge's gObjToWorldMatrix c15 and gObjToProjMatrix c0). Set by the game at start.
+
+// VR fork: a matrix of the draw's vertex constants (VrDrawMatrix: the world or world-view-projection), as row vectors.
+void VulkanCommandProcessor::VrDrawMatrix(bool world_view_projection, float (&out)[16]) const {
+  const RegisterFile& regs = *register_file_;
+  const uint32_t first = uint32_t(world_view_projection ? REXCVAR_GET(vr_wvp_constant) : REXCVAR_GET(vr_world_constant));
+  float m[16];
+  std::memcpy(m, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + std::min(first, 252u) * 4], sizeof(m));
+  if (!REXCVAR_GET(vr_constants_transposed)) {
+    std::memcpy(out, m, sizeof(m));
+    return;
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      out[r * 4 + c] = m[c * 4 + r];
+    }
+  }
+  if (!world_view_projection) {  // a 4x3 world (three registers): the row-vector matrix's last column 0, 0, 0, 1
+    out[3] = out[7] = out[11] = 0.f;
+    out[15] = 1.f;
+  }
+}
+
+// VR fork: whether the draw's world-view-projection (row vectors) is a perspective one (its w column not 0, 0, 0, 1):
+// main and reflection cameras; shadow maps and screen-space passes are orthographic.
+bool VulkanCommandProcessor::VrDrawIsPerspective() const {
+  float m[16];
+  VrDrawMatrix(true, m);
+  const float w[4] = {m[3], m[7], m[11], m[15]};
+  return std::abs(w[0]) + std::abs(w[1]) + std::abs(w[2]) > 1e-4f || std::abs(w[3] - 1.f) > 1e-4f;
+}
+
+// VR fork: whether a scene draw's projection has the headset's field of view (the head-tracked main camera, not a
+// game camera of its own such as the title logo's): its y scale (VP = World^-1 x WVP, row vectors: the length of
+// VP's second column) against 1 / the headset's vertical tangent.
+bool VulkanCommandProcessor::VrHeadTrackedProjection(const float* world, const float* world_view_projection) const {
+  float pose[16], tangents[4];
+  if (!ui::vulkan::vr::HeadPose(pose, tangents)) {
+    return true;
+  }
+  const float v = std::max(tangents[2], -tangents[3]);
+  if (v <= 0.f) {
+    return true;
+  }
+  // The world's 3x3 inverse (adjugate over the determinant) times WVP's y column.
+  const float* w = world;
+  const float a = w[0], b = w[1], c = w[2], d = w[4], e = w[5], f = w[6], g = w[8], h = w[9], i = w[10];
+  const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+  if (std::abs(det) < 1e-12f) {
+    return false;
+  }
+  const float inv[9] = {(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det,
+                        (f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det,
+                        (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+  const float y[3] = {world_view_projection[1], world_view_projection[5], world_view_projection[9]};
+  float length = 0.f;
+  for (int r = 0; r < 3; ++r) {
+    const float component = inv[r * 3] * y[0] + inv[r * 3 + 1] * y[1] + inv[r * 3 + 2] * y[2];
+    length += component * component;
+  }
+  return std::abs(std::sqrt(length) * v - 1.f) < 0.05f;
+}
+
+// VR fork: D3D's clear quad (its vertex shader, three screen-space corners of a rectangle list, position first) clears
+// the 360's way: a 4x surface over the target's EDRAM, often then the target itself. The render target cache moves a
+// target's old contents into the surface it binds (a transfer) before the clear overwrites them: ~3.5 ms of a 19.5 ms
+// frame at 2x4 resolution scale, stereo. The rectangle every sample of which the quad covers (either pixel-centre
+// convention), within the scissor, when the draw writes all of each target it uses: depth and stencil always replaced,
+// colour all channels without blending or alpha test; else false.
+uint64_t g_vr_clear_reasons[8];  // VR fork, development: why clear quads got no cutout
+bool VulkanCommandProcessor::VrClearCutout(const Shader& vertex_shader, uint32_t normalized_color_mask,
+                                           reg::RB_DEPTHCONTROL normalized_depth_control,
+                                           VulkanRenderTargetCache::VrRect& rect, uint32_t& targets) const {
+  if (vertex_shader.ucode_data_hash() != 0x1E6883FCCDE1F688ull || vertex_shader.vertex_bindings().empty()) {
+    return false;
+  }
+  const RegisterFile& regs = *register_file_;
+  const auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  if (initiator.prim_type != xenos::PrimitiveType::kRectangleList || initiator.num_indices != 3) {
+    ++g_vr_clear_reasons[0];
+    return false;
+  }
+  if (vte.vport_x_scale_ena || vte.vport_x_offset_ena || vte.vport_y_scale_ena || vte.vport_y_offset_ena ||
+      (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable &&
+       (window_offset.window_x_offset || window_offset.window_y_offset))) {
+    ++g_vr_clear_reasons[5];
+    return false;
+  }
+  // Depth only (kDepthOnly: no pixel shader) when no colour is written.
+  if ((edram_mode != xenos::EdramMode::kColorDepth &&
+       !(edram_mode == xenos::EdramMode::kDepthOnly && !normalized_color_mask)) ||
+      // (kDepthOnly runs no pixel shader: no alpha to test, as this emulator draws it.)
+      (regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable && edram_mode != xenos::EdramMode::kDepthOnly) ||
+      (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF) {
+    ++g_vr_clear_reasons[6];
+    return false;
+  }
+  targets = 0;
+  const auto& dc = normalized_depth_control;
+  bool stencil_known = false;
+  uint32_t stencil_ref = 0;
+  if (dc.z_enable || dc.stencil_enable) {  // the depth target: depth and stencil (both formats have stencil)
+    const bool front =
+        dc.stencilfunc == xenos::CompareFunction::kAlways && dc.stencilzpass == xenos::StencilOp::kReplace;
+    const bool back = !dc.backface_enable || (dc.stencilfunc_bf == xenos::CompareFunction::kAlways &&
+                                              dc.stencilzpass_bf == xenos::StencilOp::kReplace);
+    if (!dc.z_enable || !dc.z_write_enable || dc.zfunc != xenos::CompareFunction::kAlways || !dc.stencil_enable ||
+        !front || !back || regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0xFF) {
+      ++g_vr_clear_reasons[1];
+      return false;
+    }
+    targets |= 1;
+    // The stencil written: the reference (replace, all bits), the same both faces.
+    stencil_ref = regs.Get<reg::RB_STENCILREFMASK>().stencilref;
+    stencil_known = !dc.backface_enable ||
+                    regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF).stencilref == stencil_ref;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t mask = (normalized_color_mask >> (4 * i)) & 0xF;
+    if (!mask) {
+      continue;
+    }
+    const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+    if (mask != 0xF || blend.color_srcblend != xenos::BlendFactor::kOne ||
+        blend.color_destblend != xenos::BlendFactor::kZero || blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+        blend.alpha_srcblend != xenos::BlendFactor::kOne || blend.alpha_destblend != xenos::BlendFactor::kZero ||
+        blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+      ++g_vr_clear_reasons[2];
+      return false;
+    }
+    targets |= 2u << i;
+  }
+  if (!targets) {
+    return false;
+  }
+  const auto& binding = vertex_shader.vertex_bindings()[0];
+  const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+  if (binding.stride_words < 2 || fetch.size < binding.stride_words * 3) {
+    return false;
+  }
+  const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(fetch.address << 2);
+  float min_x = FLT_MAX, max_x = -FLT_MAX, min_y = FLT_MAX, max_y = -FLT_MAX;
+  // The depth written: the third word of the position, the same at every corner (no viewport scale or offset).
+  bool depth_known = stencil_known && binding.stride_words >= 3 && !vte.vport_z_scale_ena && !vte.vport_z_offset_ena;
+  const float depth = depth_known ? std::bit_cast<float>(rex::byte_swap(words[2])) : 0.f;
+  for (uint32_t v = 0; v < 3; ++v) {
+    if (depth_known && std::bit_cast<float>(rex::byte_swap(words[v * binding.stride_words + 2])) != depth) {
+      depth_known = false;
+    }
+    const float x = std::bit_cast<float>(rex::byte_swap(words[v * binding.stride_words]));
+    const float y = std::bit_cast<float>(rex::byte_swap(words[v * binding.stride_words + 1]));
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+      return false;
+    }
+    min_x = std::min(min_x, x);
+    max_x = std::max(max_x, x);
+    min_y = std::min(min_y, y);
+    max_y = std::max(max_y, y);
+  }
+  // The pixels whose whole area (every sample) the rectangle covers: centres at integers (D3D's, the 360's usual: the
+  // pixel [p - 0.5, p + 0.5]) or at halves ([p, p + 1]).
+  const float centre = regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.f;
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  const int32_t x0 = std::max(int32_t(std::ceil(min_x + centre)), int32_t(scissor.offset[0]));
+  const int32_t y0 = std::max(int32_t(std::ceil(min_y + centre)), int32_t(scissor.offset[1]));
+  const int32_t x1 = std::min(int32_t(std::floor(max_x + centre)), int32_t(scissor.offset[0] + scissor.extent[0]));
+  const int32_t y1 = std::min(int32_t(std::floor(max_y + centre)), int32_t(scissor.offset[1] + scissor.extent[1]));
+  if (x0 < 0 || y0 < 0 || x1 <= x0 || y1 <= y0) {
+    ++g_vr_clear_reasons[3];
+    return false;
+  }
+  ++g_vr_clear_reasons[4];
+  rect = {uint32_t(x0), uint32_t(y0), uint32_t(x1 - x0), uint32_t(y1 - y0)};
+  rect.depth_known = depth_known && std::isfinite(depth);
+  rect.depth = depth;
+  rect.stencil = stencil_ref;
+  return true;
+}
+
+// VR fork: the edges to fill in a copy of a render target drawn at a resolution scale.
+int VulkanCommandProcessor::VrScaledEdges() const {
+  return (render_target_cache_->draw_resolution_scale_x() > 1 ? ui::vulkan::vr::kCopyFillColumn : 0) |
+         (render_target_cache_->draw_resolution_scale_y() > 1 ? ui::vulkan::vr::kCopyFillRow : 0);
+}
+
+// VR fork, development: VR_LOG_FRAME=N (swaps counted from the start).
+bool VulkanCommandProcessor::VrLogThisFrame() const {
+  static const uint32_t frame = [] {
+    const char* v = std::getenv("VR_LOG_FRAME");
+    return v ? uint32_t(std::atoi(v)) : 0u;
+  }();
+  return frame && vr_log_swap_count_ == frame;
+}
+
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                        uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  // VR fork, development: VULKAN_RDOC_TRIGGER=<file>: when the file appears, RenderDoc (injected) captures a frame.
+  if (static const char* trigger = std::getenv("VULKAN_RDOC_TRIGGER"); trigger && *trigger) {
+    static std::unique_ptr<ui::RenderDocAPI> renderdoc = ui::RenderDocAPI::CreateIfConnected();
+    if (renderdoc && std::filesystem::exists(trigger)) {
+      std::error_code ec;
+      std::filesystem::remove(trigger, ec);
+      renderdoc->api_1_0_0()->TriggerCapture();
+      REXGPU_INFO("RenderDoc capture triggered");
+    }
+  }
+  if (VrLogThisFrame()) {  // VR fork, development
+    REXGPU_INFO("vr frame swap: frontbuffer {:08X} {}x{}", frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+  ++vr_log_swap_count_;
+  vr_log_draw_index_ = 0;
+  vr_output_width_ = frontbuffer_width;  // VR fork: the HUD split's target width (the next frames')
+  vr_output_height_ = frontbuffer_height;
+  {  // VR fork, development: the game's frame rate every 2 s (average, worst frame) in the log.
+    static auto window_start = std::chrono::steady_clock::now();
+    static auto last = window_start;
+    static uint32_t frames = 0;
+    static double worst_ms = 0.0;
+    const auto now = std::chrono::steady_clock::now();
+    worst_ms = std::max(worst_ms, std::chrono::duration<double, std::milli>(now - last).count());
+    last = now;
+    ++frames;
+    const double seconds = std::chrono::duration<double>(now - window_start).count();
+    if (seconds >= 2.0) {
+      static uint64_t last_waits = 0, last_wait_us = 0;
+      const uint64_t waits = g_submission_counters[2].load(), wait_us = g_submission_counters[3].load();
+      REXGPU_INFO("FPS {:.1f} (worst frame {:.1f} ms), replay + submit {:.2f} ms/frame, GPU waits {:.1f}/frame "
+                  "{:.2f} ms/frame, render targets {}, GPU {:.2f} ms/frame (draws {:.2f}, transfers {:.2f}, resolves {:.2f}, "
+                  "texture loads {:.2f}, uploads {:.2f})",
+                  frames / seconds, worst_ms, g_vr_execute_us.exchange(0) / 1000.0 / std::max(1u, frames),
+                  double(waits - last_waits) / std::max(1u, frames),
+                  (wait_us - last_wait_us) / 1000.0 / std::max(1u, frames),
+                  render_target_cache_ && render_target_cache_->GetPath() ==
+                                              RenderTargetCache::Path::kPixelShaderInterlock
+                      ? "FSI"
+                      : "host",
+                  [&] {
+                    uint64_t total = 0;
+                    for (auto& z : g_vr_gpu_zone_ns) total += z.load();
+                    return total;
+                  }() / 1e6 / std::max(1u, frames),
+                  g_vr_gpu_zone_ns[0].exchange(0) / 1e6 / std::max(1u, frames),
+                  g_vr_gpu_zone_ns[1].exchange(0) / 1e6 / std::max(1u, frames),
+                  g_vr_gpu_zone_ns[2].exchange(0) / 1e6 / std::max(1u, frames),
+                  g_vr_gpu_zone_ns[3].exchange(0) / 1e6 / std::max(1u, frames),
+                  g_vr_gpu_zone_ns[4].exchange(0) / 1e6 / std::max(1u, frames));
+      {  // VR fork, development: the pixels the EDRAM emulation moves a frame (as recorded: once an eye)
+        extern uint64_t g_vr_px_stats[8];
+        const double f = std::max(1u, frames);
+        REXGPU_INFO("  EDRAM Mpx/frame an eye: transfers {:.2f} ({:.1f} draws), dumps {:.2f} ({:.1f}), resolve copies "
+                    "{:.2f} ({:.1f}), scaled texture loads {:.2f} ({:.1f})",
+                    g_vr_px_stats[0] / 1e6 / f, g_vr_px_stats[1] / f, g_vr_px_stats[2] / 1e6 / f,
+                    g_vr_px_stats[3] / f, g_vr_px_stats[4] / 1e6 / f, g_vr_px_stats[5] / f,
+                    g_vr_px_stats[6] / 1e6 / f, g_vr_px_stats[7] / f);
+        std::memset(g_vr_px_stats, 0, sizeof(g_vr_px_stats));
+        extern void VrLogTransferKinds(uint32_t frames);
+        VrLogTransferKinds(std::max(1u, frames));
+        extern uint64_t g_vr_stencil_draws[2];
+        extern uint64_t g_vr_direct_stats[4];
+        REXGPU_INFO("  stencil draws/frame: testing {:.1f}, writing {:.1f}; direct resolves {:.1f}, fallbacks {:.1f}, "
+                    "CPU {:.3f} ms/frame (Resolve {:.3f})",
+                    g_vr_stencil_draws[0] / f, g_vr_stencil_draws[1] / f, g_vr_direct_stats[0] / f,
+                    g_vr_direct_stats[1] / f, g_vr_direct_stats[2] / 1e6 / f, g_vr_direct_stats[3] / 1e6 / f);
+        g_vr_stencil_draws[0] = g_vr_stencil_draws[1] = 0;
+        g_vr_direct_stats[0] = g_vr_direct_stats[1] = g_vr_direct_stats[2] = g_vr_direct_stats[3] = 0;
+        extern std::map<std::string, uint64_t> g_vr_direct_fallbacks;
+        for (const auto& [why, n] : g_vr_direct_fallbacks) {
+          REXGPU_INFO("  direct resolve fallback {:.1f}/frame: {}", n / f, why);
+        }
+        g_vr_direct_fallbacks.clear();
+        {  // VR fork, development: video memory by kind
+          extern std::map<std::string, std::pair<uint32_t, uint64_t>> g_vr_rt_memory;
+          uint64_t rt_total = 0;
+          std::vector<std::pair<uint64_t, std::string>> kinds;
+          for (const auto& [kind, v] : g_vr_rt_memory) {
+            rt_total += v.second;
+            kinds.emplace_back(v.second, fmt::format("{} x{} {} MB", kind, v.first, v.second >> 20));
+          }
+          std::sort(kinds.begin(), kinds.end(), std::greater<>());
+          std::string top;
+          for (size_t k = 0; k < std::min<size_t>(kinds.size(), 8); ++k) {
+            top += kinds[k].second + "; ";
+          }
+          extern uint64_t g_vr_rt_freed;
+          REXGPU_INFO("  VRAM: render targets {} MB in {} kinds (largest: {}), textures {} MB, right-eye twins {} MB",
+                      (rt_total - std::min(rt_total, g_vr_rt_freed)) >> 20, g_vr_rt_memory.size(), top,
+                      texture_cache_->VrTexturesBytes() >> 20, ui::vulkan::vr::TwinBytes() >> 20);
+        }
+        extern std::map<std::string, uint64_t> g_vr_load_kinds;
+        for (const auto& [kind, n] : g_vr_load_kinds) {
+          REXGPU_INFO("  scaled load {:.1f}/frame: {}", n / f, kind);
+        }
+        g_vr_load_kinds.clear();
+      }
+      {  // VR fork, development: the costliest detail zones
+        std::vector<std::pair<uint64_t, uint32_t>> details;
+        for (uint32_t i = 0; i < 256; ++i) {
+          if (const uint64_t ns = g_vr_gpu_detail_ns[i].exchange(0)) {
+            details.emplace_back(ns, i);
+          }
+        }
+        std::sort(details.begin(), details.end(), std::greater<>());
+        std::scoped_lock lock{g_vr_gpu_detail_mutex};
+        for (size_t k = 0; k < std::min<size_t>(details.size(), 12); ++k) {
+          REXGPU_INFO("  GPU {:.2f} ms/frame: {}", details[k].first / 1e6 / std::max(1u, frames),
+                      g_vr_gpu_detail_names[details[k].second]);
+        }
+      }
+      last_waits = waits;
+      last_wait_us = wait_us;
+      window_start = now;
+      frames = 0;
+      worst_ms = 0.0;
+    }
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+  ui::vulkan::vr::OnGpuSwap(frontbuffer_ptr);  // VR fork: the head pose this frame was rendered with
+  ui::vulkan::vr::dlss::NextFrame(frontbuffer_width * texture_cache_->draw_resolution_scale_x(),  // VR fork
+                                  frontbuffer_height * texture_cache_->draw_resolution_scale_y());
 
   if (!graphics_system_)
     return;
@@ -2991,6 +3803,28 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
         }
 
+        // VR fork: the finished picture to the headset's screen (copied at the submission's replay); a split
+        // frame's scene and HUD are copied already.
+        // VR fork: the guest output's release barrier first (the copy takes it in its internal layout).
+        SubmitBarriers(true);
+        VrHudStatsFrame(vr_frame_scene_, vr_hud_screen_ >= 0);  // VR fork, development
+        ui::vulkan::vr::SetFrameHasScene(vr_frame_scene_);  // without a head-tracked scene: on the screen
+        vr_frame_scene_ = false;
+        if (const int vr_screen = ui::vulkan::vr::BeginFrame(guest_output_width, guest_output_height);
+            vr_screen >= 0) {
+          deferred_command_buffer_.CmdVrFrameCopy(vulkan_context.image(),
+                                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout,
+                                                  guest_output_width, guest_output_height, vr_screen);
+        } else if (vr_screen <= -2) {  // split: the desktop shows the left eye's scene (the output holds the HUD)
+          deferred_command_buffer_.CmdVrFrameCopy(vulkan_context.image(),
+                                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout,
+                                                  guest_output_width, guest_output_height, -2 - vr_screen,
+                                                  ui::vulkan::vr::kCopyToOutput);
+        }
+        vr_hud_screen_ = -1;
+        vr_hud_copy_pending_ = false;
+        vr_hud_target_ = nullptr;
+
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue, and also need to submit the release barrier.
@@ -3412,7 +4246,8 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
         descriptor_set_layout_bindings_.emplace_back();
     descriptor_set_layout_binding.binding = uint32_t(i);
     descriptor_set_layout_binding.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-    descriptor_set_layout_binding.descriptorCount = 1;
+    // VR fork: multiview, both eyes' views of a pixel shader texture.
+    descriptor_set_layout_binding.descriptorCount = !is_vertex && ui::vulkan::vr::Multiview() ? 2 : 1;
     descriptor_set_layout_binding.stageFlags = stage_flags;
   }
   for (size_t i = 0; i < sampler_count; ++i) {
@@ -3426,7 +4261,10 @@ VkDescriptorSetLayout VulkanCommandProcessor::GetTextureDescriptorSetLayout(bool
   VkDescriptorSetLayoutCreateInfo descriptor_set_layout_create_info;
   descriptor_set_layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
   descriptor_set_layout_create_info.pNext = nullptr;
-  descriptor_set_layout_create_info.flags = 0;
+  descriptor_set_layout_create_info.flags =  // VR fork: stereo pushes pixel shader textures per draw
+      !is_vertex && ui::vulkan::vr::PushTextures(texture_count, sampler_count)
+          ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR
+          : 0;
   descriptor_set_layout_create_info.bindingCount = uint32_t(binding_count);
   descriptor_set_layout_create_info.pBindings = descriptor_set_layout_bindings_.data();
   VkDescriptorSetLayout texture_descriptor_set_layout;
@@ -3495,8 +4333,9 @@ const VulkanPipelineCache::PipelineLayoutProvider* VulkanCommandProcessor::GetPi
   pipeline_layout_create_info.flags = 0;
   pipeline_layout_create_info.setLayoutCount = uint32_t(rex::countof(descriptor_set_layouts));
   pipeline_layout_create_info.pSetLayouts = descriptor_set_layouts;
-  pipeline_layout_create_info.pushConstantRangeCount = 0;
-  pipeline_layout_create_info.pPushConstantRanges = nullptr;
+  // VR fork: stereo pushes the eye's shift to guest vertex shaders.
+  pipeline_layout_create_info.pushConstantRangeCount = ui::vulkan::vr::Stereo() ? 1 : 0;
+  pipeline_layout_create_info.pPushConstantRanges = &ui::vulkan::vr::EyeShiftRange();
   VkPipelineLayout pipeline_layout;
   if (dfn.vkCreatePipelineLayout(device, &pipeline_layout_create_info, nullptr, &pipeline_layout) !=
       VK_SUCCESS) {
@@ -3698,11 +4537,44 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
 
   // Vertex shader analysis.
   auto vertex_shader = static_cast<VulkanShader*>(active_vertex_shader());
+  // VR fork: the HUD layer. A posed frame splits at its first HUD draw into the 1x target of the output's width:
+  // the scene is copied out, the target cleared, and the HUD drawn over transparent black (its alpha blending counting
+  // coverage) goes to its own layer at the target's resolve.
+  const bool vr_hud_draw = VrHudDraw(vertex_shader);
+  struct VrHudBlend {
+    RegisterFile* regs = nullptr;
+    uint32_t saved = 0;
+    ~VrHudBlend() {
+      if (regs) {
+        (*regs)[reg::RB_BLENDCONTROL::rt_register_indices[0]] = saved;
+      }
+    }
+  } vr_hud_blend;
+  if (vr_hud_draw) {
+    const uint32_t index = reg::RB_BLENDCONTROL::rt_register_indices[0];
+    reg::RB_BLENDCONTROL blend;
+    blend.value = (*register_file_)[index];
+    if (blend.alpha_srcblend == xenos::BlendFactor::kSrcAlpha) {
+      vr_hud_blend.regs = register_file_;
+      vr_hud_blend.saved = blend.value;
+      blend.alpha_srcblend = xenos::BlendFactor::kOne;
+      (*register_file_)[index] = blend.value;
+    }
+  }
   if (!vertex_shader) {
     // Always need a vertex shader.
     return draw_fail("missing_vertex_shader");
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+  {  // VR fork, development: MCLA_VR_SKIP_VS="HASH,HASH" leaves those vertex shaders' draws out
+    static const std::string skip = [] {
+      const char* v = std::getenv("MCLA_VR_SKIP_VS");
+      return std::string(v ? v : "");
+    }();
+    if (!skip.empty() && skip.find(fmt::format("{:016X}", vertex_shader->ucode_data_hash())) != std::string::npos) {
+      return true;
+    }
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
   if (memexport_used_vertex) {
     if (!device_properties.vertexPipelineStoresAndAtomics) {
@@ -3743,6 +4615,267 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       return true;
     }
   }
+  // VR fork: MCLA's camera motion blur (and depth of field) pass, half resolution: 8 taps along the motion from this
+  // and the previous frame's camera, scaled by ps c166.x; its alpha, how much of this softer half-resolution copy the
+  // composite blends in, adds c167.x times the blur and min(|motion|^c252.y, c251.w) * c252.z. The game's motion blur
+  // option (mcla_motion_blur, off in VR) only stops the game setting c166 / c167, which leaves the effect's defaults,
+  // and c252.z is the shader's own: head turns smeared the image and softened it all. Off: the three 0 for this draw
+  // (c252.z is read nowhere else in it).
+  struct VrConstantOverride {
+    VulkanCommandProcessor* processor = nullptr;
+    uint32_t registers[3] = {}, values[3] = {};
+    ~VrConstantOverride() {
+      for (uint32_t i = 0; processor && i < 3; ++i) {
+        processor->WriteRegister(registers[i], values[i]);
+      }
+    }
+  } vr_motion_blur_off;
+  if (pixel_shader && pixel_shader->ucode_data_hash() == 0xA6B9B6B0FA692C54ull &&
+      rex::cvar::GetFlagByName("mcla_motion_blur") == "false") {
+    vr_motion_blur_off.processor = this;
+    vr_motion_blur_off.registers[0] = XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * 166;
+    vr_motion_blur_off.registers[1] = XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * 167;
+    vr_motion_blur_off.registers[2] = XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * 252 + 2;
+    for (uint32_t i = 0; i < 3; ++i) {
+      vr_motion_blur_off.values[i] = regs[vr_motion_blur_off.registers[i]];
+      WriteRegister(vr_motion_blur_off.registers[i], 0);
+    }
+  }
+  // VR fork: MCLA's foliage (vs 4D181C0D99016B72, depth AD73CDF775982D19) spreads its cards along c208 (k x the
+  // camera's right, level) and c209 (k x its up made level), from the viewport's camera, which in VR carries the
+  // head's pose: distant trees turned with the head (and with its movement). In the scene pass they get the game's
+  // own: the same from the camera without the head's pose (pose^T x the posed rows c12-c14), so foliage is as the
+  // flat game draws it. The scene's draws are told by their projection (the headset's, VrHeadTrackedProjection; they
+  // go to a multisampled target narrower than the output); other passes (the sun's shadow maps) keep theirs. Restored after the draw. MCLA_VR_FOLIAGE=0
+  // leaves them as the game sets them.
+  struct VrVertexConstantPatch {
+    VulkanCommandProcessor* processor = nullptr;
+    uint32_t registers[8] = {}, values[8] = {};
+    uint32_t count = 0;
+    ~VrVertexConstantPatch() {
+      while (processor && count) {
+        --count;
+        processor->WriteRegister(registers[count], values[count]);
+      }
+    }
+  } vr_foliage_patch;
+  if ((vertex_shader->ucode_data_hash() == 0x4D181C0D99016B72ull ||
+       vertex_shader->ucode_data_hash() == 0xAD73CDF775982D19ull) &&
+      ui::vulkan::vr::Active() &&
+      [&] {
+        float world[16], world_view_projection[16];
+        VrDrawMatrix(false, world);
+        VrDrawMatrix(true, world_view_projection);
+        return VrHeadTrackedProjection(world, world_view_projection);
+      }()) {
+    static const bool enabled = !(std::getenv("MCLA_VR_FOLIAGE") && std::getenv("MCLA_VR_FOLIAGE")[0] == '0');
+    float pose[16];
+    if (enabled && ui::vulkan::vr::DrawnPose(pose)) {
+      auto c = [&](uint32_t index, uint32_t component) {
+        float f;
+        std::memcpy(&f, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * index + component], sizeof(f));
+        return f;
+      };
+      // The camera drawing them, from its view-projection (the world's 3x3 inverse times WVP's x and w columns: its
+      // right and forward; c12-c14 are not that camera on the title), then the game's camera's right (row 0) and
+      // back (row 2): m_k = sum_r pose[r][k] x posed row r.
+      const float a = c(0, 0), b = c(0, 1), cc = c(0, 2), d = c(1, 0), e = c(1, 1), f = c(1, 2), g = c(2, 0),
+                  h = c(2, 1), i = c(2, 2);
+      const float det = a * (e * i - f * h) - b * (d * i - f * g) + cc * (d * h - e * g);
+      float posed[3][3];
+      bool posed_ok = std::abs(det) > 1e-12f;
+      if (posed_ok) {
+        const float inv[9] = {(e * i - f * h) / det, (cc * h - b * i) / det, (b * f - cc * e) / det,
+                              (f * g - d * i) / det, (a * i - cc * g) / det, (cc * d - a * f) / det,
+                              (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+        float x[3], w[3];
+        for (int r = 0; r < 3; ++r) {
+          x[r] = inv[r * 3] * c(8, 0) + inv[r * 3 + 1] * c(9, 0) + inv[r * 3 + 2] * c(10, 0);
+          w[r] = inv[r * 3] * c(8, 3) + inv[r * 3 + 1] * c(9, 3) + inv[r * 3 + 2] * c(10, 3);
+        }
+        const float lx = std::sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]),
+                    lw = std::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        posed_ok = lx > 1e-6f && lw > 1e-6f;
+        for (int j = 0; posed_ok && j < 3; ++j) {
+          posed[0][j] = x[j] / lx;
+          posed[2][j] = -w[j] / lw;
+        }
+        if (posed_ok) {  // up = back x right
+          posed[1][0] = posed[2][1] * posed[0][2] - posed[2][2] * posed[0][1];
+          posed[1][1] = posed[2][2] * posed[0][0] - posed[2][0] * posed[0][2];
+          posed[1][2] = posed[2][0] * posed[0][1] - posed[2][1] * posed[0][0];
+        }
+      }
+      float right[3] = {}, back[3] = {};
+      for (int j = 0; posed_ok && j < 3; ++j) {
+        for (int r = 0; r < 3; ++r) {
+          right[j] += pose[r * 4 + 0] * posed[r][j];
+          back[j] += pose[r * 4 + 2] * posed[r][j];
+        }
+      }
+      const float k = std::sqrt(c(208, 0) * c(208, 0) + c(208, 2) * c(208, 2));
+      const float right_level = std::sqrt(right[0] * right[0] + right[2] * right[2]);
+      const float back_level = std::sqrt(back[0] * back[0] + back[2] * back[2]);
+      if (k > 0.f && right_level > 1e-3f && back_level > 1e-3f) {
+        // c209 = k x (-forward.y) x the level forward = k x back.y x (-level back).
+        // c208.w = 1 (unused by the game) asks the shader to face each card to the camera's position (Matt: "facing
+        // you is perfect"); the axes written are the game camera's, what the shader keeps for a card it cannot face.
+        const float values[5] = {k * right[0] / right_level,  k * right[2] / right_level,
+                                 -k * back[1] * back[0] / back_level, -k * back[1] * back[2] / back_level, 1.f};
+        const uint32_t registers[5] = {XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 208,
+                                       XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 208 + 2,
+                                       XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 209,
+                                       XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 209 + 2,
+                                       XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * 208 + 3};
+        vr_foliage_patch.processor = this;
+        for (int i = 0; i < 5; ++i) {
+          vr_foliage_patch.registers[vr_foliage_patch.count] = registers[i];
+          vr_foliage_patch.values[vr_foliage_patch.count++] = regs[registers[i]];
+          uint32_t bits;
+          std::memcpy(&bits, &values[i], sizeof(bits));
+          WriteRegister(registers[i], bits);
+        }
+      }
+    }
+  }
+  // VR fork, development: MCLA_VR_PS_CONST="HASH:252.w=0;HASH:69.x=1.5" sets pixel shader constants for that
+  // shader's draws (restored after the draw); MCLA_VR_PS_CONST_LOG=HASH logs the constants it reads every 600 frames.
+  struct VrConstantPatch {
+    VulkanCommandProcessor* processor = nullptr;
+    std::vector<std::pair<uint32_t, uint32_t>> saved;
+    ~VrConstantPatch() {
+      for (auto it = saved.rbegin(); it != saved.rend(); ++it) {
+        processor->WriteRegister(it->first, it->second);
+      }
+    }
+  } vr_constant_patch;
+  if (pixel_shader) {
+    struct Patch {
+      uint64_t hash;
+      uint32_t reg;
+      float value;
+    };
+    static std::vector<Patch> patches;
+    static uint32_t patches_swap = UINT32_MAX;
+    static const bool patches_wanted = std::getenv("MCLA_VR_PS_CONST") || std::getenv("MCLA_VR_PS_CONST_FILE");
+    if (patches_wanted &&
+        (patches_swap == UINT32_MAX || (vr_log_swap_count_ != patches_swap && vr_log_swap_count_ % 30 == 0))) {
+      patches_swap = vr_log_swap_count_;
+      std::vector<Patch> list;
+      const char* v = std::getenv("MCLA_VR_PS_CONST");
+      std::string text = v ? v : "";
+      if (const char* file = std::getenv("MCLA_VR_PS_CONST_FILE")) {  // re-read every 30 frames
+        if (FILE* f = std::fopen(file, "rb")) {
+          char buffer[1024] = {};
+          std::fread(buffer, 1, sizeof(buffer) - 1, f);
+          std::fclose(f);
+          text = buffer;
+          while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) {
+            text.pop_back();
+          }
+        }
+      }
+      size_t start = 0;
+      while (start < text.size()) {
+        size_t end = text.find(';', start);
+        if (end == std::string::npos) {
+          end = text.size();
+        }
+        const std::string item = text.substr(start, end - start);
+        start = end + 1;
+        unsigned long long hash = 0;
+        unsigned index = 0;
+        char component = 'x';
+        float value = 0.f;
+        if (std::sscanf(item.c_str(), "%llx:%u.%c=%f", &hash, &index, &component, &value) == 4 && index < 256) {
+          const uint32_t c = component == 'y' ? 1 : component == 'z' ? 2 : component == 'w' ? 3 : 0;
+          list.push_back({hash, uint32_t(XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * index + c), value});
+        }
+      }
+      patches = std::move(list);
+    }
+    for (const Patch& patch : patches) {
+      if (patch.hash == pixel_shader->ucode_data_hash()) {
+        vr_constant_patch.processor = this;
+        vr_constant_patch.saved.emplace_back(patch.reg, regs[patch.reg]);
+        uint32_t bits;
+        std::memcpy(&bits, &patch.value, 4);
+        WriteRegister(patch.reg, bits);
+      }
+    }
+    static const uint64_t log_hash = [] {
+      const char* v = std::getenv("MCLA_VR_PS_CONST_LOG");
+      return v ? std::strtoull(v, nullptr, 16) : 0ull;
+    }();
+    static uint32_t logged_swap = UINT32_MAX;
+    if (log_hash && pixel_shader->ucode_data_hash() == log_hash && vr_log_swap_count_ / 600 != logged_swap) {
+      logged_swap = vr_log_swap_count_ / 600;
+      pipeline_cache_->AnalyzeShaderUcode(*pixel_shader);
+      const Shader::ConstantRegisterMap& map = pixel_shader->constant_register_map();
+      std::string text;
+      for (uint32_t i = 0; i < 256; ++i) {
+        if (map.float_bitmap[i >> 6] >> (i & 63) & 1) {
+          float f[4];
+          std::memcpy(f, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * i], sizeof(f));
+          text += fmt::format(" c{} {:.4g} {:.4g} {:.4g} {:.4g};", i, f[0], f[1], f[2], f[3]);
+        }
+      }
+      REXGPU_INFO("VR ps {:016X} constants:{}", log_hash, text);
+    }
+    // VR fork: MCLA's picture options (its settings menu, DISPLAY), constants of four of its pixel shaders for their
+    // draws. mcla_car_windows: the car glass's opacity (c26.w, 1 as shipped; the glass layer is what washes the view
+    // out of the car); mcla_sun_glow off: the screen-space glow around the sun (c255.x); mcla_bloom off: the bloom
+    // bright pass's output (c250, c251.xyz, c254.xyz); mcla_colour_grade off: the composite's warm tint (c68, gains
+    // 1.16 / 1.0 / 0.83 at 0.58 / 0.5 / 0.42) and 90% saturation (c67.x) made neutral.
+    auto constant = [&](uint32_t index, uint32_t component) {
+      float f;
+      std::memcpy(&f, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * index + component], sizeof(f));
+      return f;
+    };
+    auto set = [&](uint32_t index, uint32_t component, float value) {
+      const uint32_t reg = XE_GPU_REG_SHADER_CONSTANT_256_X + 4 * index + component;
+      vr_constant_patch.processor = this;
+      vr_constant_patch.saved.emplace_back(reg, regs[reg]);
+      uint32_t bits;
+      std::memcpy(&bits, &value, sizeof(bits));
+      WriteRegister(reg, bits);
+    };
+    switch (pixel_shader->ucode_data_hash()) {
+      case 0xF9289A8E0AD3DAE9ull: {  // car glass
+        const std::string windows = rex::cvar::GetFlagByName("mcla_car_windows");
+        if (windows == "light" || windows == "clear") {
+          set(26, 3, windows == "clear" ? 0.f : 0.5f * constant(26, 3));
+        }
+        break;
+      }
+      case 0x10FE9CB4C0D39096ull:  // sun glow
+        if (rex::cvar::GetFlagByName("mcla_sun_glow") == "false") {
+          set(255, 0, 0.f);
+        }
+        break;
+      case 0x347DA187A22B4B38ull:  // bloom bright pass
+        if (rex::cvar::GetFlagByName("mcla_bloom") == "false") {
+          for (uint32_t i = 0; i < 4; ++i) {
+            set(250, i, 0.f);
+          }
+          for (uint32_t i = 0; i < 3; ++i) {
+            set(251, i, 0.f);
+            set(254, i, 0.f);
+          }
+        }
+        break;
+      case 0xE5EBEFAE4D165CBAull:  // composite
+        if (rex::cvar::GetFlagByName("mcla_colour_grade") == "false") {
+          for (uint32_t i = 0; i < 3; ++i) {
+            set(68, i, 0.5f);
+          }
+          set(67, 0, 1.f);
+        }
+        break;
+      default:
+        break;
+    }
+  }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   if (memexport_used_pixel) {
     if (!device_properties.fragmentStoresAndAtomics) {
@@ -3754,6 +4887,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     draw_util::AddMemExportRanges(regs, *pixel_shader, memexport_ranges_);
   }
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
+  {  // VR fork, development: draws testing / writing stencil
+    extern uint64_t g_vr_stencil_draws[2];
+    const auto& dc = normalized_depth_control;
+    if (dc.stencil_enable) {
+      const bool tests = dc.stencilfunc != xenos::CompareFunction::kAlways ||
+                         (dc.backface_enable && dc.stencilfunc_bf != xenos::CompareFunction::kAlways);
+      const bool writes = regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask != 0 &&
+                          (dc.stencilzpass != xenos::StencilOp::kKeep || dc.stencilfail != xenos::StencilOp::kKeep ||
+                           dc.stencilzfail != xenos::StencilOp::kKeep ||
+                           (dc.backface_enable && (dc.stencilzpass_bf != xenos::StencilOp::kKeep ||
+                                                   dc.stencilfail_bf != xenos::StencilOp::kKeep ||
+                                                   dc.stencilzfail_bf != xenos::StencilOp::kKeep)));
+      g_vr_stencil_draws[0] += tests;
+      g_vr_stencil_draws[1] += writes;
+    }
+  }
 
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
@@ -3984,6 +5133,86 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
 
+  // VR fork, development: MCLA_VR_CLEAR_LOG=1: forty of D3D's clear quads in gameplay (targets, masks, scissor,
+  // the quad's first vertices), and the transfers before them (render target cache).
+  static const bool vr_clear_log = std::getenv("MCLA_VR_CLEAR_LOG") != nullptr;
+  static uint32_t vr_clear_logged = 0;
+  VulkanRenderTargetCache::vr_log_transfers = false;
+  {  // VR fork, development: MCLA_VR_TRANSFER_TRACE=1: frames 1800-1801, every draw and its transfers
+    static const bool vr_transfer_trace = std::getenv("MCLA_VR_TRANSFER_TRACE") != nullptr;
+    if (vr_transfer_trace && g_vr_hud_stats.frames >= 1800 && g_vr_hud_stats.frames < 1802) {
+      VulkanRenderTargetCache::vr_log_transfers = true;
+      const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+      const auto& dc = normalized_depth_control;
+      std::string text = fmt::format(
+          "VR trace: frame {} draw {} vs {:016X} ps {:016X} pitch {} msaa {} mode {} colour mask {:04X} z {}/{} "
+          "stencil {} func {}/{} write {:02X} depth base {} alpha test {} aa mask {:04X} prim {} count {}",
+          g_vr_hud_stats.frames, vr_log_draw_index_, vertex_shader->ucode_data_hash(),
+          pixel_shader ? pixel_shader->ucode_data_hash() : 0, uint32_t(surface.surface_pitch),
+          uint32_t(surface.msaa_samples), uint32_t(edram_mode), normalized_color_mask, uint32_t(dc.z_enable),
+          uint32_t(dc.z_write_enable), uint32_t(dc.stencil_enable), uint32_t(dc.stencilfunc),
+          uint32_t(dc.stencilfunc_bf), uint32_t(regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask),
+          uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base),
+          uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable), regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF,
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type),
+          uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices));
+      for (uint32_t i = 0; i < 4; ++i) {
+        if ((normalized_color_mask >> (4 * i)) & 0xF) {
+          text += fmt::format(" rt{} base {}", i,
+                              uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base));
+        }
+      }
+      if (pixel_shader) {  // the textures the pixel shader reads: fetch constant, address, size
+        for (const auto& binding : pixel_shader->texture_bindings()) {
+          const auto fetch = regs.GetTextureFetch(binding.fetch_constant);
+          text += fmt::format(" tf{} {:08X} {}x{}", binding.fetch_constant, uint32_t(fetch.base_address) << 12,
+                              uint32_t(fetch.size_2d.width) + 1, uint32_t(fetch.size_2d.height) + 1);
+        }
+      }
+      REXGPU_INFO("{}", text);
+    }
+  }
+  if (vr_clear_log && vertex_shader->ucode_data_hash() == 0x1E6883FCCDE1F688ull && g_vr_hud_stats.frames > 1500 &&
+      vr_clear_logged < 40) {
+    ++vr_clear_logged;
+    VulkanRenderTargetCache::vr_log_transfers = true;
+    draw_util::Scissor scissor;
+    draw_util::GetScissor(regs, scissor);
+    const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+    std::string text = fmt::format(
+        "VR clear: frame {} pitch {} msaa {} scissor {},{} {}x{} colour mask {:04X} z {}/{} stencil {} write {:02X} "
+        "depth base {}",
+        g_vr_hud_stats.frames, uint32_t(surface.surface_pitch), uint32_t(surface.msaa_samples), scissor.offset[0],
+        scissor.offset[1], scissor.extent[0], scissor.extent[1], normalized_color_mask,
+        uint32_t(normalized_depth_control.z_enable), uint32_t(normalized_depth_control.z_write_enable),
+        uint32_t(normalized_depth_control.stencil_enable), uint32_t(regs.Get<reg::RB_STENCILREFMASK>().stencilwritemask),
+        uint32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base));
+    for (uint32_t i = 0; i < 4; ++i) {
+      if ((normalized_color_mask >> (4 * i)) & 0xF) {
+        text += fmt::format(" rt{} base {}", i,
+                            uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base));
+      }
+    }
+    if (!vertex_shader->vertex_bindings().empty()) {
+      const auto& binding = vertex_shader->vertex_bindings()[0];
+      const auto fetch = regs.GetVertexFetch(binding.fetch_constant);
+      const uint32_t* words = memory_->TranslatePhysical<const uint32_t*>(fetch.address << 2);
+      const auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+      text += fmt::format(" | prim {} count {} stride {} words:", uint32_t(initiator.prim_type),
+                          uint32_t(initiator.num_indices), binding.stride_words);
+      for (uint32_t i = 0; i < std::min<uint32_t>(28, fetch.size); ++i) {
+        text += fmt::format(" {:g}", std::bit_cast<float>(rex::byte_swap(words[i])));
+      }
+    }
+    REXGPU_INFO("{}", text);
+  }
+  {  // VR fork: no transfers of what D3D's clear quad overwrites (VrClearCutout)
+    VulkanRenderTargetCache::VrRect rect;
+    uint32_t targets = 0;
+    const bool cutout = is_rasterization_done &&
+                        VrClearCutout(*vertex_shader, normalized_color_mask, normalized_depth_control, rect, targets);
+    render_target_cache_->VrSetClearCutout(cutout ? &rect : nullptr, targets);
+  }
   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
   // Set up the render targets - this may perform dispatches and draws.
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
@@ -4255,12 +5484,121 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
   }
 
+  if (vr_motion_image_ && !vr_motion_prepared_) {  // VR fork: DLSS's object motion image, general from the start
+    vr_motion_prepared_ = true;
+    PushImageMemoryBarrier(vr_motion_image_, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                           VK_IMAGE_LAYOUT_GENERAL);
+  }
   // After all commands that may dispatch, copy or insert barriers, submit
   // the barriers (may end the render pass), and (re)enter the render pass
   // before drawing.
   SubmitBarriersAndEnterRenderTargetCacheRenderPass(
       render_target_cache_->last_update_render_pass(),
       render_target_cache_->last_update_framebuffer());
+  if (ui::vulkan::vr::Stereo()) {  // VR fork: the eye's shift, pushed at each eye's replay
+    const bool perspective = VrDrawIsPerspective();
+    ui::vulkan::vr::EyePush vr_push{};  // DLSS's sub-pixel jitter (0 without DLSS) and the draw's own motion
+    ui::vulkan::vr::dlss::FrameJitter(vr_push.jitter_x, vr_push.jitter_y);
+    if (perspective && vr_output_width_ &&  // DLSS's camera: a perspective draw into the output-wide scene
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == vr_output_width_ &&
+        regs.Get<reg::RB_DEPTHCONTROL>().z_enable) {
+      float world[16], world_view_projection[16];
+      VrDrawMatrix(false, world);
+      VrDrawMatrix(true, world_view_projection);
+      ui::vulkan::vr::dlss::NoteSceneDraw(world, world_view_projection);
+      if (!vr_frame_scene_ && VrHeadTrackedProjection(world, world_view_projection)) {
+        vr_frame_scene_ = true;
+        ui::vulkan::vr::SceneDrawStarted();  // VR fork: the pose this frame is drawn with
+        {  // VR fork, development (MCLA_VR_POSE_TRACE): the yaw the GPU draws this frame's scene with
+          const float* w = world;
+          const float a = w[0], b = w[1], c = w[2], d = w[4], e = w[5], f = w[6], g = w[8], h = w[9], i = w[10];
+          const float det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+          if (std::abs(det) > 1e-12f) {
+            const float inv[9] = {(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det,
+                                  (f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det,
+                                  (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+            const float x[3] = {world_view_projection[0], world_view_projection[4], world_view_projection[8]};
+            float r[3];
+            for (int k = 0; k < 3; ++k) {
+              r[k] = inv[k * 3] * x[0] + inv[k * 3 + 1] * x[1] + inv[k * 3 + 2] * x[2];
+            }
+            ui::vulkan::vr::TraceGpuCameraYaw(std::atan2(-r[2], r[0]) * 57.2958f);
+          }
+        }
+      }
+      // The same draw last frame (its shaders, vertices, indices and place among such draws): its own motion.
+      uint64_t key = vertex_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull ^
+                     (pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+      if (!vertex_shader->vertex_bindings().empty()) {
+        key = key * 31 + regs.GetVertexFetch(vertex_shader->vertex_bindings()[0].fetch_constant).address;
+      }
+      key = key * 31 + (index_buffer_info ? index_buffer_info->guest_base : 0);
+      key = key * 31 + index_count;
+      if (ui::vulkan::vr::dlss::DrawMotion(key, world, world_view_projection, vr_push)) {
+        vr_push.motion = 1.f;
+      }
+    }
+    deferred_command_buffer_.CmdVrEyeShift(current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+                                           perspective, vr_push);
+    // What it draws differs per eye: its targets do. D3D's clear (a quad with its own vertex shader) starts them
+    // over, the same in both eyes.
+    const bool clear = vertex_shader->ucode_data_hash() == 0x1E6883FCCDE1F688ull;
+    if (clear || perspective || vr_vertex_textures_eye_ || (pixel_shader && vr_pixel_textures_eye_)) {
+      const bool eye_dependent = !clear;
+      const uint32_t color_mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+      for (uint32_t i = 0; i < 4; ++i) {
+        if ((color_mask >> (4 * i)) & 0xF) {
+          vr_eye_targets_.set(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]).color_base,
+                              eye_dependent);
+        }
+      }
+      const auto depth_control = regs.Get<reg::RB_DEPTHCONTROL>();
+      if (depth_control.z_enable || depth_control.stencil_enable) {
+        vr_eye_targets_.set(regs.Get<reg::RB_DEPTH_INFO>().depth_base, eye_dependent);
+      }
+    }
+  }
+  if (vr_hud_copy_pending_) {  // VR fork: the split (VrHudDraw): the scene out, the target cleared for the HUD
+    vr_hud_copy_pending_ = false;
+    if (const void* target = render_target_cache_->VrColorTarget0()) {
+      VkImage image;
+      VkImageLayout layout;
+      VulkanRenderTargetCache::VrTargetImage(target, image, layout);
+      const uint32_t width = vr_output_width_ * render_target_cache_->draw_resolution_scale_x();
+      const uint32_t height = vr_output_height_ * render_target_cache_->draw_resolution_scale_y();
+      EndRenderPass();
+      deferred_command_buffer_.CmdVrFrameCopy(image, layout, width, height, vr_hud_screen_,
+                                              ui::vulkan::vr::kCopyScene | VrScaledEdges());
+      SubmitBarriersAndEnterRenderTargetCacheRenderPass(render_target_cache_->last_update_render_pass(),
+                                                        render_target_cache_->last_update_framebuffer());
+      VkClearAttachment clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
+      VkClearRect rect{{{0, 0}, {width, height}}, 0, 1};
+      deferred_command_buffer_.CmdVkClearAttachments(1, &clear, 1, &rect);
+      vr_hud_target_ = target;
+    }
+  }
+  if (VrLogThisFrame()) {  // VR fork, development: VR_LOG_FRAME=N logs the Nth frame's draws and resolves
+    const auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+    const auto color0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    const auto blend0 = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+    const auto depth = regs.Get<reg::RB_DEPTH_INFO>();
+    REXGPU_INFO("vr frame draw {}: vs {:016X} ps {:016X} pitch {} msaa {} rt0 base {} fmt {} mask {:X} blend {:08X} "
+                "depth base {} z {} vertices {}",
+                vr_log_draw_index_++, vertex_shader->ucode_data_hash(),
+                pixel_shader ? pixel_shader->ucode_data_hash() : 0, uint32_t(surface.surface_pitch),
+                uint32_t(surface.msaa_samples), uint32_t(color0.color_base), uint32_t(color0.color_format),
+                regs[XE_GPU_REG_RB_COLOR_MASK] & 0xF, blend0.value, uint32_t(depth.depth_base),
+                uint32_t(regs.Get<reg::RB_DEPTHCONTROL>().z_enable), index_count);
+    std::string constants;
+    for (uint32_t i = 0; i < 16 * 4; ++i) {
+      float f;
+      std::memcpy(&f, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i], 4);
+      constants += fmt::format("{:.3g}{}", f, i % 4 == 3 ? " | " : " ");
+    }
+    REXGPU_INFO("vr frame draw constants: {}", constants);
+  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -4313,8 +5651,8 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
   }
 
-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
-      !memexport_ranges_.empty()) {
+  if (!memexport_ranges_.empty() &&  // VR fork: the cheap test first (the cvar lookup is a locked string search)
+      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
     uint32_t memexport_total_size = 0;
     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
       memexport_total_size += memexport_range.size_bytes;
@@ -4537,11 +5875,92 @@ bool VulkanCommandProcessor::IssueCopy() {
     return false;
   }
 
+  if (vr_hud_target_) {  // VR fork: the split frame's HUD, from its target before the resolve
+    const RegisterFile& regs = *register_file_;
+    if (regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base == vr_hud_base_ &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == vr_hud_pitch_) {
+      VkImage image;
+      VkImageLayout layout;
+      VulkanRenderTargetCache::VrTargetImage(vr_hud_target_, image, layout);
+      EndRenderPass();
+      deferred_command_buffer_.CmdVrFrameCopy(
+          image, layout,
+          vr_output_width_ * render_target_cache_->draw_resolution_scale_x(),
+          vr_output_height_ * render_target_cache_->draw_resolution_scale_y(), vr_hud_screen_,
+          ui::vulkan::vr::kCopyHud | VrScaledEdges());
+      ui::vulkan::vr::HudCaptured();
+      vr_hud_target_ = nullptr;
+    }
+  }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(vulkan_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
-    return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
-                                         written_address, written_length);
+    const bool resolved = render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
+                                                        written_address, written_length);
+    if (VulkanRenderTargetCache::vr_log_transfers) {  // VR fork, development (MCLA_VR_TRANSFER_TRACE)
+      REXGPU_INFO("VR trace: resolve to {:08X}, {} bytes", written_address, written_length);
+    }
+    if (ui::vulkan::vr::Stereo()) {  // VR fork: the resolved pages differ per eye if the target did; clears
+      const RegisterFile& regs = *register_file_;
+      const auto copy_control = regs.Get<reg::RB_COPY_CONTROL>();
+      const uint32_t source_base =
+          copy_control.copy_src_select >= 4
+              ? regs.Get<reg::RB_DEPTH_INFO>().depth_base
+              : regs.Get<reg::RB_COLOR_INFO>(
+                        reg::RB_COLOR_INFO::rt_register_indices[copy_control.copy_src_select & 3])
+                    .color_base;
+      if (written_length) {
+        shared_memory_->VrMarkEyeDependent(written_address, written_length, vr_eye_targets_.test(source_base));
+      }
+      if (const VkImage direct = render_target_cache_->VrDirectResolvedImage();
+          direct != VK_NULL_HANDLE && vr_eye_targets_.test(source_base)) {
+        ui::vulkan::vr::MarkEyeDependent(direct);  // written straight from an eye-dependent target
+      }
+      // DLSS: the scene's depth at its resolve (an output-wide colour copy after perspective draws: the camera is
+      // taken once, so the frontbuffer's resolve after the post-processing has none).
+      DeferredCommandBuffer::ArgsVrDlssDepth vr_depth{};
+      uint32_t vr_depth_samples = 0;
+      const void* vr_depth_target = nullptr;
+      if (copy_control.copy_src_select < 4 && vr_output_width_ &&
+          regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == vr_output_width_ &&
+          (vr_depth_target = render_target_cache_->VrDepthTarget())) {
+        // A single-sampled depth only (the game's occasional multisampled passes leave the frame's camera for a later
+        // resolve).
+        VulkanRenderTargetCache::VrDepthImage(vr_depth_target, vr_depth.image, vr_depth.view, vr_depth.layout,
+                                              vr_depth_samples);
+        if (vr_depth_samples == 1 && ui::vulkan::vr::dlss::TakeSceneCamera(vr_depth.view_projection, vr_depth.jitter_x,
+                                                                            vr_depth.jitter_y, vr_depth.frame)) {
+          vr_depth.width = vr_output_width_ * render_target_cache_->draw_resolution_scale_x();
+          vr_depth.height = vr_output_height_ * render_target_cache_->draw_resolution_scale_y();
+          EndRenderPass();  // a compute pass
+          deferred_command_buffer_.CmdVrDlssDepth(vr_depth);
+        }
+      }
+      if (VrLogThisFrame()) {
+        REXGPU_INFO("vr frame resolve source {} base {} eye {} clear color {} depth {} -> {:08X} {}",
+                    uint32_t(copy_control.copy_src_select), source_base, vr_eye_targets_.test(source_base),
+                    uint32_t(copy_control.color_clear_enable), uint32_t(copy_control.depth_clear_enable),
+                    written_address, written_length);
+      }
+      if (copy_control.color_clear_enable) {
+        vr_eye_targets_.reset(regs.Get<reg::RB_COLOR_INFO>(
+                                  reg::RB_COLOR_INFO::rt_register_indices[copy_control.copy_src_select & 3])
+                                  .color_base);
+      }
+      if (copy_control.depth_clear_enable) {
+        vr_eye_targets_.reset(regs.Get<reg::RB_DEPTH_INFO>().depth_base);
+      }
+    }
+    if (VrLogThisFrame()) {  // VR fork, development
+      const RegisterFile& regs = *register_file_;
+      REXGPU_INFO("vr frame resolve after draw {}: pitch {} msaa {} rt0 base {} fmt {} -> {:08X} ({} bytes)",
+                  vr_log_draw_index_, uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch),
+                  uint32_t(regs.Get<reg::RB_SURFACE_INFO>().msaa_samples),
+                  uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base),
+                  uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format),
+                  written_address, written_length);
+    }
+    return resolved;
   }
 
   return IssueCopy_ReadbackResolvePath();
@@ -4966,8 +6385,11 @@ bool VulkanCommandProcessor::AcquireOcclusionQueryIndex(uint32_t& host_index_out
 void VulkanCommandProcessor::DisableHostOcclusionQueries() {
   if (active_occlusion_query_.valid && occlusion_query_pool_ != VK_NULL_HANDLE) {
     if (BeginSubmission(true)) {
+      // VR fork: the query began outside a render pass, and is ended once (EndSubmission ends an active one too).
+      EndRenderPass();
       deferred_command_buffer_.CmdVkEndQuery(occlusion_query_pool_,
                                              active_occlusion_query_.host_index);
+      active_occlusion_query_ = {};
       EndSubmission(false);
     }
   }
@@ -5111,15 +6533,44 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
 
   size_t fences_total = submissions_in_flight_fences_.size();
   size_t fences_awaited = 0;
+  if (async_submit_) {  // VR fork: only the submission thread's submitted fences (it owns them until vkQueueSubmit)
+    uint64_t submitted = submitted_submission_.load(std::memory_order_acquire);
+    if (await_submission > submitted) {
+      std::unique_lock lock{submission_mutex_};
+      submission_idle_cv_.wait(lock, [&] {
+        return (submitted = submitted_submission_.load(std::memory_order_acquire)) >= await_submission;
+      });
+    }
+    fences_total = std::min(fences_total, size_t(submitted - submission_completed_));
+  }
   if (await_submission > submission_completed_) {
     // Await in a blocking way if requested.
     // TODO(Triang3l): Await only one fence. "Fence signal operations that are
     // defined by vkQueueSubmit additionally include in the first
     // synchronization scope all commands that occur earlier in submission
     // order."
-    VkResult wait_result =
-        dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
-                            submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
+    const uint64_t wait_start_us = CounterNowMicros();
+    // VR fork, development: a wait over 5 s logs the state once (then keeps waiting).
+    VkResult wait_result;
+    bool vr_stall_logged = false;
+    while ((wait_result = dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                                              submissions_in_flight_fences_.data(), VK_TRUE,
+                                              UINT64_C(5000000000))) == VK_TIMEOUT) {
+      if (!vr_stall_logged) {
+        vr_stall_logged = true;
+        std::string statuses;
+        for (size_t i = 0; i < fences_total; ++i) {
+          statuses += std::to_string(int(dfn.vkGetFenceStatus(device, submissions_in_flight_fences_[i]))) + " ";
+        }
+        REXGPU_ERROR("STALL: awaiting submission {} (completed {}, submitted {}, current {}); in-flight fences: {}; "
+                     "last job waited on {} semaphores",
+                     await_submission, submission_completed_, submitted_submission_.load(), GetCurrentSubmission(),
+                     statuses, vr_last_job_waits_);
+      }
+    }
+    g_submission_counters[2].fetch_add(1, std::memory_order_relaxed);
+    g_submission_counters[3].fetch_add(CounterNowMicros() - wait_start_us,
+                                       std::memory_order_relaxed);
     if (wait_result == VK_SUCCESS) {
       fences_awaited += await_submission - submission_completed_;
     } else {
@@ -5371,6 +6822,7 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
+    render_target_cache_->VrNextFrame();  // VR fork
   }
 
   return true;
@@ -5455,6 +6907,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       active_occlusion_query_ = {};
     }
 
+    render_target_cache_->VrFlushPendingTransfers();  // VR fork: held-back transfers (clear quads) recorded first
     EndRenderPass();
 
     pipeline_cache_->EndSubmission();
@@ -5477,8 +6930,13 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
             sparse_buffer_bind_infos_temp_.emplace_back();
         sparse_buffer_bind_info.buffer = sparse_buffer_bind.buffer;
         sparse_buffer_bind_info.bindCount = sparse_buffer_bind.bind_count;
+        // VR fork: an offset for now (TwinSparseBinds may grow the vector), a pointer below.
         sparse_buffer_bind_info.pBinds =
-            sparse_memory_binds_.data() + sparse_buffer_bind.bind_offset;
+            reinterpret_cast<const VkSparseMemoryBind*>(uintptr_t(sparse_buffer_bind.bind_offset));
+      }
+      ui::vulkan::vr::TwinSparseBinds(sparse_buffer_bind_infos_temp_, sparse_memory_binds_);  // VR fork
+      for (VkSparseBufferMemoryBindInfo& info : sparse_buffer_bind_infos_temp_) {
+        info.pBinds = sparse_memory_binds_.data() + uintptr_t(info.pBinds);
       }
       assert_false(semaphores_free_.empty());
       VkSemaphore bind_sparse_semaphore = semaphores_free_.back();
@@ -5519,6 +6977,47 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
 
     assert_false(command_buffers_writable_.empty());
     CommandBuffer command_buffer = command_buffers_writable_.back();
+    if (async_submit_) {  // VR fork: replayed and submitted on the submission thread, in order
+      assert_false(fences_free_.empty());
+      VkFence fence = fences_free_.back();
+      if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
+        REXGPU_ERROR("Failed to reset a Vulkan submission fence");
+        return false;
+      }
+      SubmissionJob job;
+      {
+        std::scoped_lock lock{submission_mutex_};
+        if (!submission_free_streams_.empty()) {
+          job.stream = std::move(submission_free_streams_.back());
+          submission_free_streams_.pop_back();
+        }
+      }
+      deferred_command_buffer_.TakeStream(job.stream);
+      job.command_buffer = command_buffer;
+      job.wait_semaphores = current_submission_wait_semaphores_;
+      job.wait_stage_masks = current_submission_wait_stage_masks_;
+      job.fence = fence;
+      job.submission = GetCurrentSubmission();
+      vr_last_job_waits_ = uint32_t(job.wait_semaphores.size());
+      ui::vulkan::vr::TakeFrameSignal(job.vr_semaphore, job.vr_value);  // VR fork: the headset's frame
+      {
+        std::scoped_lock lock{submission_mutex_};
+        submission_jobs_.push_back(std::move(job));
+      }
+      submission_cv_.notify_one();
+      g_submission_counters[0].fetch_add(1, std::memory_order_relaxed);
+      uint64_t submission_current = GetCurrentSubmission();
+      current_submission_wait_stage_masks_.clear();
+      for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
+        submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+      }
+      current_submission_wait_semaphores_.clear();
+      command_buffers_submitted_.emplace_back(submission_current, command_buffer);
+      command_buffers_writable_.pop_back();
+      submissions_in_flight_fences_.push_back(fence);
+      fences_free_.pop_back();
+      submission_open_ = false;
+    } else {
     if (dfn.vkResetCommandPool(device, command_buffer.pool, 0) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to reset a Vulkan command pool");
       return false;
@@ -5532,6 +7031,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    const auto vr_execute_start = std::chrono::steady_clock::now();  // VR fork: development timing
     deferred_command_buffer_.Execute(command_buffer.buffer);
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
@@ -5566,6 +7066,10 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
     }
+    g_vr_execute_us.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - vr_execute_start)
+                                  .count()),
+                              std::memory_order_relaxed);  // VR fork: development timing
     if (submit_result != VK_SUCCESS) {
       REXGPU_ERROR("Failed to submit a Vulkan command buffer");
       if (submit_result == VK_ERROR_DEVICE_LOST && !device_lost_) {
@@ -5589,6 +7093,7 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     fences_free_.pop_back();
 
     submission_open_ = false;
+    }  // VR fork: inline submission
   }
 
   if (is_closing_frame) {
@@ -5599,6 +7104,19 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kMaxFramesInFlight] = GetCurrentSubmission() - 1;
 
+    // VR fork: render targets owning no EDRAM and idle for 600 frames are freed (each spans all of EDRAM at the
+    // scale, twice in stereo: 30 of them took 6.6 GB at 2x4) when video memory runs low (under 3 GB free): the
+    // freeing waits for the GPU (a ~50 ms hitch), not worth it on a card with room. MCLA_VR_PRUNE_RT=0 never,
+    // =2 whenever any are idle.
+    static const int vr_prune = [] {
+      const char* v = std::getenv("MCLA_VR_PRUNE_RT");
+      return v ? std::atoi(v) : 1;
+    }();
+    if (vr_prune && !cache_clear_requested_ && frame_current_ % 300 == 0 &&
+        (vr_prune == 2 || ui::vulkan::vr::VideoMemoryFreeGB(GetVulkanDevice()) < 3.0) &&
+        render_target_cache_->VrCountIdleRenderTargets(600) && AwaitAllQueueOperationsCompletion()) {
+      render_target_cache_->VrPruneIdleRenderTargets(600);
+    }
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;
 
@@ -5642,6 +7160,8 @@ void VulkanCommandProcessor::ClearTransientDescriptorPools() {
 
   constants_transient_descriptors_free_.clear();
   constants_transient_descriptors_used_.clear();
+  vr_constants_dynamic_allocator_.Reset();  // VR fork
+  vr_constant_set_frame_ = UINT64_MAX;
   for (std::vector<VkDescriptorSet>& transient_descriptors_free :
        single_transient_descriptors_free_) {
     transient_descriptors_free.clear();
@@ -6566,6 +8086,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       (UINT32_C(1) << SpirvShaderTranslator::kConstantBufferCount) - 1;
   assert_zero(current_constant_buffers_up_to_date_ & ~kAllConstantBuffersMask);
   if ((current_constant_buffers_up_to_date_ & kAllConstantBuffersMask) != kAllConstantBuffersMask) {
+    const uint32_t vr_constants_before = current_constant_buffers_up_to_date_;  // VR fork
     current_graphics_descriptor_set_values_up_to_date_ &=
         ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants);
     size_t uniform_buffer_alignment =
@@ -6598,9 +8119,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       // dummy buffer.
       size_t float_constants_size =
           sizeof(float) * 4 * std::max(float_constant_count_vertex, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, float_constants_size,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping = uniform_buffer_pool_->Request(
+          frame_current_,
+          vr_dynamic_constants_ ? size_t(VrConstantRange(SpirvShaderTranslator::kConstantBufferFloatVertex))
+                                : float_constants_size,  // VR fork
+          uniform_buffer_alignment, buffer_info.buffer, buffer_info.offset);
       if (!mapping) {
         return false;
       }
@@ -6614,19 +8137,19 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       uint32_t packed_sources[8];
       uint32_t packed_written = 0;
       for (uint32_t i = 0; i < 4; ++i) {
+        // VR fork: runs of consecutive constants in one copy (they are consecutive registers), the bit scans
+        // inline (rex::bit_scan_forward is a call into another module).
         uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          if (packed_written < 8) {
-            packed_sources[packed_written] = (i << 6) + float_constant_index;
+        while (float_constant_map_entry) {
+          const uint32_t first = uint32_t(std::countr_zero(float_constant_map_entry));
+          const uint32_t count = uint32_t(std::countr_one(float_constant_map_entry >> first));
+          for (uint32_t k = 0; k < count && packed_written < 8; ++k) {
+            packed_sources[packed_written++] = (i << 6) + first + k;
           }
-          ++packed_written;
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
+          std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (first << 2)],
+                      sizeof(float) * 4 * count);
+          mapping += sizeof(float) * 4 * count;
+          float_constant_map_entry &= count >= 64 ? 0 : ~(((uint64_t(1) << count) - 1) << first);
         }
       }
       {
@@ -6659,23 +8182,26 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
           current_constant_buffer_infos_[SpirvShaderTranslator::kConstantBufferFloatPixel];
       size_t float_constants_size =
           sizeof(float) * 4 * std::max(float_constant_count_pixel, UINT32_C(1));
-      uint8_t* mapping = uniform_buffer_pool_->Request(frame_current_, float_constants_size,
-                                                       uniform_buffer_alignment, buffer_info.buffer,
-                                                       buffer_info.offset);
+      uint8_t* mapping = uniform_buffer_pool_->Request(
+          frame_current_,
+          vr_dynamic_constants_ ? size_t(VrConstantRange(SpirvShaderTranslator::kConstantBufferFloatVertex))
+                                : float_constants_size,  // VR fork
+          uniform_buffer_alignment, buffer_info.buffer, buffer_info.offset);
       if (!mapping) {
         return false;
       }
       buffer_info.range = VkDeviceSize(float_constants_size);
       for (uint32_t i = 0; i < 4; ++i) {
+        // VR fork: runs of consecutive constants in one copy (they are consecutive registers), the bit scans
+        // inline (rex::bit_scan_forward is a call into another module).
         uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              mapping,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
-              sizeof(float) * 4);
-          mapping += sizeof(float) * 4;
+        while (float_constant_map_entry) {
+          const uint32_t first = uint32_t(std::countr_zero(float_constant_map_entry));
+          const uint32_t count = uint32_t(std::countr_one(float_constant_map_entry >> first));
+          std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (first << 2)],
+                      sizeof(float) * 4 * count);
+          mapping += sizeof(float) * 4 * count;
+          float_constant_map_entry &= count >= 64 ? 0 : ~(((uint64_t(1) << count) - 1) << first);
         }
       }
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
@@ -6714,6 +8240,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       std::memcpy(mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], kFetchConstantsSize);
       current_constant_buffers_up_to_date_ |= UINT32_C(1)
                                               << SpirvShaderTranslator::kConstantBufferFetch;
+    }
+    if (vr_dynamic_constants_) {  // VR fork
+      VrDynamicConstants(current_constant_buffers_up_to_date_ & ~vr_constants_before);
     }
   }
 
@@ -6758,6 +8287,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       (texture_count_pixel || sampler_count_pixel) &&
       !(current_graphics_descriptor_set_values_up_to_date_ &
         (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  if (!texture_count_vertex) {  // VR fork: no textures sampled, none different per eye
+    vr_vertex_textures_eye_ = false;
+  }
+  if (!texture_count_pixel) {
+    vr_pixel_textures_eye_ = false;
+  }
   descriptor_write_image_info_.clear();
   descriptor_write_image_info_.reserve(
       (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
@@ -6773,6 +8308,11 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;
     }
+  }
+  if (write_vertex_textures && ui::vulkan::vr::Stereo()) {  // VR fork: any of them different per eye
+    vr_vertex_textures_eye_ = ui::vulkan::vr::AnyViewEyeDependent(
+        descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+        descriptor_write_image_info_.size() - vertex_texture_image_info_offset);
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
   if (write_vertex_textures && sampler_count_vertex) {
@@ -6793,6 +8333,23 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
                                               ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
                                               : VK_IMAGE_LAYOUT_UNDEFINED;
     }
+  }
+  // VR fork: stereo pushes pixel shader textures (each eye its own views) rather than writing a set.
+  const bool vr_push_pixel_textures =
+      write_pixel_textures && ui::vulkan::vr::PushTextures(texture_count_pixel, sampler_count_pixel);
+  if (vr_push_pixel_textures) {
+    vr_right_texture_infos_.assign(descriptor_write_image_info_.begin() + pixel_texture_image_info_offset,
+                                   descriptor_write_image_info_.end());
+    vr_pixel_textures_eye_ = false;
+    for (VkDescriptorImageInfo& info : vr_right_texture_infos_) {
+      const VkImageView view = info.imageView;
+      info.imageView = ui::vulkan::vr::RightEyeView(view);
+      vr_pixel_textures_eye_ |= info.imageView != view;
+    }
+  } else if (write_pixel_textures && ui::vulkan::vr::Stereo()) {  // VR fork: any of them different per eye
+    vr_pixel_textures_eye_ = ui::vulkan::vr::AnyViewEyeDependent(
+        descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+        descriptor_write_image_info_.size() - pixel_texture_image_info_offset);
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
   if (write_pixel_textures && sampler_count_pixel) {
@@ -6825,8 +8382,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       VkDescriptorPoolSize constants_descriptor_count;
       constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       constants_descriptor_count.descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
-      constants_descriptor_set = transient_descriptor_allocator_uniform_buffer_.Allocate(
-          descriptor_set_layout_constants_, &constants_descriptor_count, 1);
+      if (vr_dynamic_constants_) {  // VR fork
+        constants_descriptor_count.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+      }
+      constants_descriptor_set =
+          (vr_dynamic_constants_ ? vr_constants_dynamic_allocator_ : transient_descriptor_allocator_uniform_buffer_)
+              .Allocate(descriptor_set_layout_constants_, &constants_descriptor_count, 1);
       if (constants_descriptor_set == VK_NULL_HANDLE) {
         return false;
       }
@@ -6842,7 +8403,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
       write_constants.dstBinding = i;
       write_constants.dstArrayElement = 0;
       write_constants.descriptorCount = 1;
-      write_constants.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+      write_constants.descriptorType = vr_dynamic_constants_ ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC
+                                                             : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       write_constants.pImageInfo = nullptr;
       write_constants.pBufferInfo = &current_constant_buffer_infos_[i];
       write_constants.pTexelBufferView = nullptr;
@@ -6850,6 +8412,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetConstants] =
         constants_descriptor_set;
+    if (vr_dynamic_constants_) {  // VR fork: the set's buffers, for VrDynamicConstants
+      for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+        vr_constant_set_buffers_[i] = current_constant_buffer_infos_[i].buffer;
+      }
+      vr_constant_set_frame_ = frame_current_;
+    }
   }
   // Vertex shader textures and samplers.
   if (write_vertex_textures) {
@@ -6869,13 +8437,25 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
         write_textures[0].dstSet;
   }
   // Pixel shader textures and samplers.
-  if (write_pixel_textures) {
+  if (write_pixel_textures && !vr_push_pixel_textures) {
     VkWriteDescriptorSet* write_textures =
         write_descriptor_sets.data() + write_descriptor_set_count;
+    // VR fork: multiview, each texture's binding holds both eyes' views.
+    const VkDescriptorImageInfo* vr_pixel_texture_infos =
+        descriptor_write_image_info_.data() + pixel_texture_image_info_offset;
+    thread_local std::vector<VkDescriptorImageInfo> vr_pixel_texture_pairs;
+    if (ui::vulkan::vr::Multiview() && texture_count_pixel) {
+      vr_pixel_texture_pairs.resize(size_t(texture_count_pixel) * 2);
+      for (uint32_t i = 0; i < texture_count_pixel; ++i) {
+        vr_pixel_texture_pairs[2 * i] = vr_pixel_texture_pairs[2 * i + 1] = vr_pixel_texture_infos[i];
+        vr_pixel_texture_pairs[2 * i + 1].imageView = ui::vulkan::vr::RightEyeView(vr_pixel_texture_infos[i].imageView);
+      }
+      vr_pixel_texture_infos = vr_pixel_texture_pairs.data();
+    }
     uint32_t texture_descriptor_set_write_count = WriteTransientTextureBindings(
         false, texture_count_pixel, sampler_count_pixel,
         current_guest_graphics_pipeline_layout_->descriptor_set_layout_textures_pixel_ref(),
-        descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+        vr_pixel_texture_infos,
         descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, write_textures);
     if (!texture_descriptor_set_write_count) {
       return false;
@@ -6899,7 +8479,8 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   if (!texture_count_vertex && !sampler_count_vertex) {
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
   }
-  if (!texture_count_pixel && !sampler_count_pixel) {
+  if ((!texture_count_pixel && !sampler_count_pixel) ||
+      ui::vulkan::vr::PushTextures(texture_count_pixel, sampler_count_pixel)) {  // VR fork: pushed, not bound
     descriptor_sets_needed &= ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
   }
   uint32_t descriptor_sets_remaining =
@@ -6908,19 +8489,52 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
     uint32_t descriptor_set_mask_tzcnt =
         rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
+    const bool vr_offsets =  // VR fork: the dynamic constants' offsets go with their set
+        vr_dynamic_constants_ && descriptor_set_index <= SpirvShaderTranslator::kDescriptorSetConstants &&
+        descriptor_set_mask_tzcnt > SpirvShaderTranslator::kDescriptorSetConstants;
     deferred_command_buffer_.CmdVkBindDescriptorSets(
         VK_PIPELINE_BIND_POINT_GRAPHICS,
         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
         descriptor_set_mask_tzcnt - descriptor_set_index,
-        current_graphics_descriptor_sets_ + descriptor_set_index, 0, nullptr);
+        current_graphics_descriptor_sets_ + descriptor_set_index,
+        vr_offsets ? SpirvShaderTranslator::kConstantBufferCount : 0, vr_offsets ? vr_constant_offsets_ : nullptr);
     if (descriptor_set_mask_tzcnt >= 32) {
       break;
     }
     descriptor_sets_remaining &= ~((UINT32_C(1) << descriptor_set_mask_tzcnt) - 1);
   }
   current_graphics_descriptor_sets_bound_up_to_date_ |= descriptor_sets_needed;
+  if (vr_push_pixel_textures) {  // VR fork: after the sets (binding set 0 with a new layout would disturb it)
+    deferred_command_buffer_.CmdVrPushTextures(
+        current_guest_graphics_pipeline_layout_->GetPipelineLayout(),
+        SpirvShaderTranslator::kDescriptorSetTexturesPixel, texture_count_pixel, sampler_count_pixel,
+        descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+        descriptor_write_image_info_.data() + pixel_sampler_image_info_offset, vr_right_texture_infos_.data());
+  }
 
   return true;
+}
+
+// VR fork: the constant buffers just written (`updated`) as dynamic offsets; the descriptor set (offset 0, the
+// largest range) is kept while its buffers stay the same within the frame, and bound again for the new offsets.
+void VulkanCommandProcessor::VrDynamicConstants(uint32_t updated) {
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    if (updated & (UINT32_C(1) << i)) {
+      VkDescriptorBufferInfo& info = current_constant_buffer_infos_[i];
+      vr_constant_offsets_[i] = uint32_t(info.offset);
+      info.offset = 0;
+      info.range = VrConstantRange(i);
+    }
+  }
+  bool same = vr_constant_set_frame_ == frame_current_;
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount && same; ++i) {
+    same = vr_constant_set_buffers_[i] == current_constant_buffer_infos_[i].buffer;
+  }
+  const uint32_t bit = UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetConstants;
+  if (same) {
+    current_graphics_descriptor_set_values_up_to_date_ |= bit;
+  }
+  current_graphics_descriptor_sets_bound_up_to_date_ &= ~bit;
 }
 
 uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
@@ -6932,6 +8546,8 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
   if (!texture_count && !sampler_count) {
     return 0;
   }
+  // VR fork: multiview, a pixel shader texture's binding holds both eyes' views (texture_image_info in pairs).
+  const uint32_t vr_texture_elements = !is_vertex && ui::vulkan::vr::Multiview() ? 2 : 1;
   TextureDescriptorSetLayoutKey texture_descriptor_set_layout_key;
   texture_descriptor_set_layout_key.texture_count = texture_count;
   texture_descriptor_set_layout_key.sampler_count = sampler_count;
@@ -6950,7 +8566,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
       VkDescriptorPoolSize& texture_descriptor_count =
           texture_descriptor_counts[texture_descriptor_counts_count++];
       texture_descriptor_count.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-      texture_descriptor_count.descriptorCount = texture_count;
+      texture_descriptor_count.descriptorCount = texture_count * vr_texture_elements;  // VR fork
     }
     if (sampler_count) {
       VkDescriptorPoolSize& texture_descriptor_count =
@@ -6979,7 +8595,7 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
     descriptor_set_write.dstSet = texture_descriptor_set;
     descriptor_set_write.dstBinding = 0;
     descriptor_set_write.dstArrayElement = 0;
-    descriptor_set_write.descriptorCount = texture_count;
+    descriptor_set_write.descriptorCount = texture_count * vr_texture_elements;  // VR fork: (consecutive bindings)
     descriptor_set_write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     descriptor_set_write.pImageInfo = texture_image_info;
     descriptor_set_write.pBufferInfo = nullptr;

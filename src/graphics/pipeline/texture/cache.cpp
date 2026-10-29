@@ -299,6 +299,12 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      for (uint32_t page : {uint32_t(texture->key().base_page), uint32_t(texture->key().mip_page)}) {  // VR fork
+        auto range = vr_textures_by_page_.equal_range(page);
+        for (auto it = range.first; it != range.second;) {
+          it = it->second == texture ? vr_textures_by_page_.erase(it) : std::next(it);
+        }
+      }
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -319,6 +325,54 @@ void TextureCache::BeginFrame() {
   // sure bindings are reset so a new attempt will surely be made if the texture
   // is requested again.
   ResetTextureBindings();
+}
+
+TextureCache::Texture* TextureCache::VrFindTexture2D(uint32_t base_page, xenos::TextureFormat format,
+                                                     uint32_t width_aligned, uint32_t height_aligned) {
+  for (auto& [key, texture] : textures_) {
+    const bool format_ok =
+        key.format == format ||
+        (format == xenos::TextureFormat(0xFF) &&
+         (key.format == xenos::TextureFormat::k_8_8_8_8 || key.format == xenos::TextureFormat::k_24_8_FLOAT ||
+          key.format == xenos::TextureFormat::k_24_8));
+    if (key.base_page == base_page && format_ok && key.tiled && key.scaled_resolve &&
+        key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() == 1 &&
+        ((key.GetWidth() + 31) & ~31u) == width_aligned && ((key.GetHeight() + 31) & ~31u) == height_aligned) {
+      return texture.get();
+    }
+  }
+  return nullptr;
+}
+
+void TextureCache::VrTexturesAt(uint32_t base_page, std::vector<void*>& textures_out) {
+  textures_out.clear();
+  auto range = vr_textures_by_page_.equal_range(base_page);
+  for (auto it = range.first; it != range.second; ++it) {
+    textures_out.push_back(it->second);
+  }
+}
+
+void TextureCache::VrTexturesContaining(uint32_t address, std::vector<void*>& textures_out) {
+  textures_out.clear();
+  for (const auto& [key, texture] : textures_) {
+    const uint32_t base = uint32_t(key.base_page) << 12;
+    if ((address >> 12) > key.base_page && address < base + texture->GetGuestBaseSize()) {
+      textures_out.push_back(texture.get());
+    }
+  }
+}
+
+std::string TextureCache::VrDescribeTexturesAt(uint32_t base_page) const {
+  std::string s;
+  for (const auto& [key, texture] : textures_) {
+    if (key.base_page == base_page || key.mip_page == base_page) {
+      s += fmt::format("[fmt {} {}x{}x{} dim {} tiled {} scaled {} mips {} mip page {:X}{}] ", uint32_t(key.format),
+                       key.GetWidth(), key.GetHeight(), key.GetDepthOrArraySize(), uint32_t(key.dimension),
+                       uint32_t(key.tiled), uint32_t(key.scaled_resolve), uint32_t(key.mip_max_level),
+                       uint32_t(key.mip_page), key.mip_page == base_page ? " (as mips)" : "");
+    }
+  }
+  return s.empty() ? std::string("none") : s;
 }
 
 void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
@@ -788,6 +842,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
   textures_.clear();
+  vr_textures_by_page_.clear();  // VR fork
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
 
@@ -904,6 +959,10 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    vr_textures_by_page_.emplace(uint32_t(key.base_page), texture);  // VR fork: the page index
+    if (key.mip_max_level && key.mip_page != key.base_page) {
+      vr_textures_by_page_.emplace(uint32_t(key.mip_page), texture);
+    }
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

@@ -26,6 +26,10 @@ class Window;
 
 namespace rex::input {
 
+// VR fork: called when one of player one's buttons goes down (X_INPUT_GAMEPAD_* bits; the game recentres the headset
+// on Start outside gameplay and on Back in the pause menu).
+void SetButtonPressedHook(void (*hook)(uint16_t button));
+
 class InputSystem : public system::IInputSystem {
  public:
   explicit InputSystem(rex::ui::Window* window);

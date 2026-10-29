@@ -17,6 +17,7 @@
 
 #include <rex/assert.h>
 #include <rex/math.h>
+#include <rex/ui/vulkan/vr_twins.h>  // VR fork: EyePush
 #include <rex/ui/vulkan/api.h>
 
 namespace rex::graphics::vulkan {
@@ -29,7 +30,104 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
-  void Execute(VkCommandBuffer command_buffer);
+  void Execute(VkCommandBuffer command_buffer) {
+    FinishPrologue();
+    Execute(command_buffer, command_stream_);
+  }
+
+  // VR fork: commands recorded between BeginPrologue and EndPrologue run before the rest of the submission, between
+  // two barriers (shared memory uploads that nothing earlier in the submission touches, so they don't split render
+  // passes). FinishPrologue puts them in front (Execute and TakeStream do).
+  void BeginPrologue();
+  void EndPrologue() { prologue_ = false; }
+  void FinishPrologue();
+
+  // VR fork, development (VULKAN_GPU_TIMING=1): a timestamp between the commands; the GPU time to the next mark counts
+  // under `category` (VrGpuZone). The submission thread's hook (vr_mark_hook) writes it.
+  void CmdVrMark(uint32_t category) {
+    *reinterpret_cast<uint32_t*>(WriteCommand(Command::kVrMark, sizeof(uintmax_t))) = category;
+  }
+  static inline void (*vr_mark_hook)(VkCommandBuffer command_buffer, uint32_t category) = nullptr;
+
+  // VR fork: the finished picture copied to the headset's screen image (ui::vulkan::vr::RecordFrameCopy).
+  struct ArgsVrFrameCopy {
+    VkImage image;
+    VkImageLayout layout;
+    uint32_t width;
+    uint32_t height;
+    int32_t screen;
+    int32_t kind;  // ui::vulkan::vr::CopyKind
+  };
+  // VR fork: a guest draw's eye shift (ui::vulkan::vr::RecordEyeShift), pushed at each eye's replay.
+  struct ArgsVrEyeShift {
+    VkPipelineLayout layout;
+    uint32_t perspective;
+    ui::vulkan::vr::EyePush push;  // DLSS's jitter and the draw's motion (the shift is the replay eye's)
+  };
+  void CmdVrEyeShift(VkPipelineLayout layout, bool perspective, const ui::vulkan::vr::EyePush& push) {
+    auto& args = *reinterpret_cast<ArgsVrEyeShift*>(WriteCommand(Command::kVrEyeShift, sizeof(ArgsVrEyeShift)));
+    args.layout = layout;
+    args.perspective = uint32_t(perspective);
+    args.push = push;
+  }
+  // VR fork: a guest pixel shader's textures and samplers pushed (ui::vulkan::vr::PushTextureDescriptors): the
+  // infos are the textures, the samplers, then the right eye's textures.
+  struct ArgsVrPushTextures {
+    VkPipelineLayout layout;
+    uint32_t set;
+    uint32_t texture_count;
+    uint32_t sampler_count;
+  };
+  void CmdVrPushTextures(VkPipelineLayout layout, uint32_t set, uint32_t texture_count, uint32_t sampler_count,
+                         const VkDescriptorImageInfo* textures, const VkDescriptorImageInfo* samplers,
+                         const VkDescriptorImageInfo* right_textures) {
+    const size_t infos_offset = rex::align(sizeof(ArgsVrPushTextures), alignof(VkDescriptorImageInfo));
+    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
+        Command::kVrPushTextures,
+        infos_offset + sizeof(VkDescriptorImageInfo) * (2 * texture_count + sampler_count)));
+    *reinterpret_cast<ArgsVrPushTextures*>(args_ptr) = {layout, set, texture_count, sampler_count};
+    auto* infos = reinterpret_cast<VkDescriptorImageInfo*>(args_ptr + infos_offset);
+    std::memcpy(infos, textures, sizeof(VkDescriptorImageInfo) * texture_count);
+    std::memcpy(infos + texture_count, samplers, sizeof(VkDescriptorImageInfo) * sampler_count);
+    std::memcpy(infos + texture_count + sampler_count, right_textures,
+                sizeof(VkDescriptorImageInfo) * texture_count);
+  }
+  // VR fork: DLSS's depth and motion from the scene's depth (ui::vulkan::vr::dlss::RecordDepthMotion).
+  struct ArgsVrDlssDepth {
+    VkImage image;
+    VkImageView view;
+    VkImageLayout layout;
+    uint32_t width, height;
+    float view_projection[16];
+    float jitter_x, jitter_y;
+    uint32_t frame;  // the GPU thread's frame (replay runs behind it)
+  };
+  void CmdVrDlssDepth(const ArgsVrDlssDepth& args) {
+    *reinterpret_cast<ArgsVrDlssDepth*>(WriteCommand(Command::kVrDlssDepth, sizeof(ArgsVrDlssDepth))) = args;
+  }
+  void CmdVrFrameCopy(VkImage image, VkImageLayout layout, uint32_t width, uint32_t height, int32_t screen,
+                      int32_t kind = 0) {
+    auto& args = *reinterpret_cast<ArgsVrFrameCopy*>(WriteCommand(Command::kVrFrameCopy, sizeof(ArgsVrFrameCopy)));
+    args = {image, layout, width, height, screen, kind};
+  }
+  static inline bool vr_marks_enabled = false;
+  // VR fork: a stream taken with TakeStream (on the command processor's submission thread).
+  void Execute(VkCommandBuffer command_buffer, const std::vector<uintmax_t>& command_stream) const;
+  // VR fork: Execute's replay with a function table (the right eye's in stereo).
+  void ExecuteWith(VkCommandBuffer command_buffer, const std::vector<uintmax_t>& command_stream,
+                   const ui::vulkan::VulkanDevice::Functions& functions) const {
+    ExecuteRange(command_buffer, command_stream.data(), command_stream.size(), functions);
+  }
+  void ExecuteRange(VkCommandBuffer command_buffer, const uintmax_t* stream, size_t stream_remaining,
+                    const ui::vulkan::VulkanDevice::Functions& functions) const;
+  // VR fork: multiview stereo's replay: a pass into render targets once (both eyes), the rest per eye.
+  void ExecuteMultiview(VkCommandBuffer command_buffer, const std::vector<uintmax_t>& command_stream) const;
+  // VR fork: the recorded commands move to `stream` (which gives its storage back for the next recording).
+  void TakeStream(std::vector<uintmax_t>& stream) {
+    FinishPrologue();
+    stream.clear();
+    command_stream_.swap(stream);
+  }
 
   // render_pass_begin->pNext of all barriers must be null.
   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
@@ -374,6 +472,11 @@ class DeferredCommandBuffer {
     kVkPipelineBarrier,
     kVkPushConstants,
     kVkResetQueryPool,
+    kVrMark,
+    kVrFrameCopy,
+    kVrEyeShift,
+    kVrPushTextures,
+    kVrDlssDepth,
     kVkSetBlendConstants,
     kVkSetDepthBias,
     kVkSetScissor,
@@ -583,6 +686,31 @@ class DeferredCommandBuffer {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  std::vector<uintmax_t> prologue_stream_;  // VR fork: BeginPrologue's
+  bool prologue_ = false;
+};
+
+// VR fork, development: GPU time of a block of recorded commands under `category` (1 render target transfers, 2
+// resolves, 3 texture loads, 4 memory uploads; 0 everything else), nested blocks restoring the outer one's.
+class VrGpuZone {
+ public:
+  VrGpuZone(DeferredCommandBuffer& buffer, uint32_t category) : buffer_(buffer), previous_(current_) {
+    if (DeferredCommandBuffer::vr_marks_enabled) {
+      current_ = category;
+      buffer_.CmdVrMark(category);
+    }
+  }
+  ~VrGpuZone() {
+    if (DeferredCommandBuffer::vr_marks_enabled) {
+      current_ = previous_;
+      buffer_.CmdVrMark(previous_);
+    }
+  }
+
+ private:
+  DeferredCommandBuffer& buffer_;
+  uint32_t previous_;
+  static inline thread_local uint32_t current_ = 0;
 };
 
 }  // namespace rex::graphics::vulkan

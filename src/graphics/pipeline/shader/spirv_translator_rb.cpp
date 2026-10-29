@@ -447,6 +447,79 @@ const ShaderProbe& XeShaderProbe() {
 }
 }  // namespace
 
+// VR fork: the draw's own motion at this pixel (DLSS, vr_dlss.cpp) when its motion is pushed: this pixel's guest clip
+// position (from FragCoord, the jitter and the eye's shift taken out) through clip_to_prev, as render pixels, with the
+// depth and the frame's tag (the camera pass takes it where the depth is the visible one).
+void SpirvShaderTranslator::StoreVrObjectMotion() {
+  if (vr_object_motion_ == spv::NoResult || vr_frag_coord_ == spv::NoResult || push_vr_eye_ == spv::NoResult) {
+    return;
+  }
+  spv::Id motion_on = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, LoadVrEyeMember(3),
+                                            builder_->makeFloatConstant(0.5f));
+  SpirvBuilder::IfBuilder motion_if(motion_on, spv::SelectionControlMaskNone, *builder_);
+  {
+    const auto fadd = [&](spv::Id a, spv::Id b) {
+      return builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, a, b);
+    };
+    const auto fsub = [&](spv::Id a, spv::Id b) {
+      return builder_->createNoContractionBinOp(spv::OpFSub, type_float_, a, b);
+    };
+    const auto fmul = [&](spv::Id a, spv::Id b) {
+      return builder_->createNoContractionBinOp(spv::OpFMul, type_float_, a, b);
+    };
+    const auto fdiv = [&](spv::Id a, spv::Id b) {
+      return builder_->createNoContractionBinOp(spv::OpFDiv, type_float_, a, b);
+    };
+    spv::Id frag = builder_->createLoad(vr_frag_coord_, spv::NoPrecision);
+    spv::Id size = LoadVrEyeMember(8);
+    spv::Id size_x = builder_->createCompositeExtract(size, type_float_, 0);
+    spv::Id size_y = builder_->createCompositeExtract(size, type_float_, 1);
+    spv::Id shift = LoadVrEyeShift();
+    spv::Id frag_x = builder_->createCompositeExtract(frag, type_float_, 0);
+    spv::Id frag_y = builder_->createCompositeExtract(frag, type_float_, 1);
+    spv::Id frag_z = builder_->createCompositeExtract(frag, type_float_, 2);
+    spv::Id w = fdiv(const_float_1_, builder_->createCompositeExtract(frag, type_float_, 3));
+    spv::Id two = builder_->makeFloatConstant(2.f), half = builder_->makeFloatConstant(0.5f);
+    // Guest NDC (y up), the jitter out.
+    spv::Id ndc_x = fsub(fsub(fmul(fdiv(frag_x, size_x), two), const_float_1_), LoadVrEyeMember(1));
+    spv::Id ndc_y = fsub(fsub(const_float_1_, fmul(fdiv(frag_y, size_y), two)), LoadVrEyeMember(2));
+    // The guest clip position without the eye's shift, through clip_to_prev (row vectors).
+    spv::Id clip[4] = {fsub(fmul(ndc_x, w), shift), fmul(ndc_y, w), fmul(frag_z, w), w};
+    spv::Id previous = spv::NoResult;
+    for (int i = 0; i < 4; ++i) {
+      spv::Id term = builder_->createBinOp(spv::OpVectorTimesScalar, type_float4_, LoadVrEyeMember(4 + i), clip[i]);
+      previous = previous == spv::NoResult
+                     ? term
+                     : builder_->createNoContractionBinOp(spv::OpFAdd, type_float4_, previous, term);
+    }
+    spv::Id previous_w = builder_->createCompositeExtract(previous, type_float_, 3);
+    spv::Id previous_x =
+        fdiv(fadd(builder_->createCompositeExtract(previous, type_float_, 0), shift), previous_w);
+    spv::Id previous_y = fdiv(builder_->createCompositeExtract(previous, type_float_, 1), previous_w);
+    spv::Id motion_x = fmul(fmul(fsub(previous_x, ndc_x), half), size_x);
+    spv::Id motion_y = fmul(fmul(fsub(ndc_y, previous_y), half), size_y);
+    // (Local vectors: LoadVrEyeMember uses id_vector_temp_.)
+    const spv::Id tag = LoadVrEyeMember(9);
+    spv::Id texel = builder_->createCompositeConstruct(type_float4_, {motion_x, motion_y, frag_z, tag});
+    spv::Id coordinates = builder_->createCompositeConstruct(
+        type_int2_, {builder_->createUnaryOp(spv::OpConvertFToS, type_int_, frag_x),
+                     builder_->createUnaryOp(spv::OpConvertFToS, type_int_, frag_y)});
+    if (vr_object_motion_right_ != spv::NoResult) {  // multiview: the view's eye's image
+      SpirvBuilder::IfBuilder eye_if(VrIsRightEye(), spv::SelectionControlMaskNone, *builder_);
+      builder_->createNoResultOp(spv::OpImageWrite,
+                                 {builder_->createLoad(vr_object_motion_right_, spv::NoPrecision), coordinates, texel});
+      eye_if.makeBeginElse();
+      builder_->createNoResultOp(spv::OpImageWrite,
+                                 {builder_->createLoad(vr_object_motion_, spv::NoPrecision), coordinates, texel});
+      eye_if.makeEndIf();
+    } else {
+      builder_->createNoResultOp(spv::OpImageWrite,
+                                 {builder_->createLoad(vr_object_motion_, spv::NoPrecision), coordinates, texel});
+    }
+  }
+  motion_if.makeEndIf();
+}
+
 void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
   // Loaded if needed.
   spv::Id msaa_samples = spv::NoResult;
@@ -487,6 +560,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
       }
     }
   }
+
+  StoreVrObjectMotion();  // VR fork: after the kill (a demoted invocation's store is dropped)
 
   uint32_t color_targets_written = current_shader().writes_color_targets();
 

@@ -38,12 +38,18 @@
 #elif defined(__gnu_linux__)
 #define REX_PLATFORM_GNU_LINUX 1
 #define REX_PLATFORM_LINUX 1
+#elif defined(__PROSPERO__) || defined(__FreeBSD__)
+// PlayStation 5 homebrew (ps5-payload-sdk): FreeBSD-derived, POSIX, not Linux.
+#define REX_PLATFORM_PS5 1
 #else
 #error Unsupported target OS.
 #endif
 
 // Ensure all platform macros are always defined (0 when inactive)
 // so they can be used in static_assert and regular expressions.
+#ifndef REX_PLATFORM_PS5
+#define REX_PLATFORM_PS5 0
+#endif
 #ifndef REX_PLATFORM_MAC
 #define REX_PLATFORM_MAC 0
 #endif

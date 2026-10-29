@@ -1,0 +1,40 @@
+#version 450
+// VR fork: DLSS's depth and motion for one eye (vr_dlss.cpp), from the scene's depth: the depth copied out (R32F),
+// and the camera's motion in render pixels, this frame to the previous one, without the jitter (DLSS gets it apart).
+// clip_to_prev maps this frame's guest clip space (x right, y up, z 0..1) to the previous frame's; it is uploaded
+// row-major (RAGE's row vectors), so m * v here is the game's v * M.
+// glslangValidator -V --target-env vulkan1.1 -x -o vr_dlss_motion.inc vr_dlss_motion.comp
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D depth_source;
+layout(binding = 1, r32f) uniform writeonly image2D depth_target;
+layout(binding = 2, rg16f) uniform writeonly image2D motion_target;
+// The draws' own motion (their pixel shaders store motion, depth and the frame's tag; vr_dlss DrawMotion).
+layout(binding = 3, rgba32f) uniform readonly image2D object_motion;
+layout(push_constant) uniform Constants {
+  mat4 clip_to_prev;
+  vec2 size;    // render pixels
+  vec2 jitter;  // this frame's, guest NDC
+  float tag;
+} constants;
+void main() {
+  const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(vec2(xy), constants.size))) {
+    return;
+  }
+  const float depth = texelFetch(depth_source, xy, 0).r;
+  imageStore(depth_target, xy, vec4(depth));
+  // The pixel's centre in guest NDC (the image has y down), the jitter taken out.
+  vec2 ndc = (vec2(xy) + 0.5) / constants.size * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  ndc -= constants.jitter;
+  vec4 previous = constants.clip_to_prev * vec4(ndc, depth, 1.0);
+  const vec2 previous_ndc = previous.xy / previous.w;
+  vec2 motion = (previous_ndc - ndc) * 0.5 * constants.size;
+  motion.y = -motion.y;
+  // A draw's own motion where it is the visible surface (its depth is the scene's) this frame.
+  const vec4 object = imageLoad(object_motion, xy);
+  if (object.w == constants.tag && abs(object.z - depth) <= 1e-5 + 1e-4 * depth) {
+    motion = object.xy;
+  }
+  imageStore(motion_target, xy, vec4(motion, 0.0, 0.0));
+}

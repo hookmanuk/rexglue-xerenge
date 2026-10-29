@@ -24,6 +24,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/platform.h>
+#include <rex/ui/vulkan/vr_openxr.h>  // VR fork
 #include <rex/ui/vulkan/presenter.h>
 #include <rex/ui/vulkan/util.h>
 
@@ -44,6 +45,9 @@
 #endif
 #if REX_PLATFORM_MAC
 #include <rex/ui/surface_mac.h>
+#endif
+#if REX_PLATFORM_PS5
+#include <rex/ui/surface_ps5.h>
 #endif
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
@@ -104,6 +108,96 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 
 }  // namespace
 #endif  // defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+
+#if REX_PLATFORM_PS5
+// Paints so far, for the host's frame-rate figures.
+std::atomic<uint64_t> g_ps5_paint_count{0};
+uint64_t Ps5PresentCount() {
+  return g_ps5_paint_count.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+// A VK_KHR_display surface on the console's display: the first display, the
+// mode whose visible region is the requested size (the first mode if none
+// is), on the first plane. Everything found is logged, since what the driver
+// reports is only known from running it.
+VkResult CreatePs5DisplaySurface(PFN_vkGetInstanceProcAddr get_instance_proc_addr,
+                                 VkInstance instance, VkPhysicalDevice physical_device,
+                                 uint32_t width, uint32_t height, VkSurfaceKHR* surface_out) {
+  const auto get_displays = PFN_vkGetPhysicalDeviceDisplayPropertiesKHR(
+      get_instance_proc_addr(instance, "vkGetPhysicalDeviceDisplayPropertiesKHR"));
+  const auto get_modes = PFN_vkGetDisplayModePropertiesKHR(
+      get_instance_proc_addr(instance, "vkGetDisplayModePropertiesKHR"));
+  const auto get_planes = PFN_vkGetPhysicalDeviceDisplayPlanePropertiesKHR(
+      get_instance_proc_addr(instance, "vkGetPhysicalDeviceDisplayPlanePropertiesKHR"));
+  const auto create_surface = PFN_vkCreateDisplayPlaneSurfaceKHR(
+      get_instance_proc_addr(instance, "vkCreateDisplayPlaneSurfaceKHR"));
+  if (!get_displays || !get_modes || !get_planes || !create_surface) {
+    REXLOG_ERROR("VulkanPresenter: the driver has no VK_KHR_display entry points");
+    return VK_ERROR_EXTENSION_NOT_PRESENT;
+  }
+
+  uint32_t display_count = 0;
+  get_displays(physical_device, &display_count, nullptr);
+  std::vector<VkDisplayPropertiesKHR> displays(display_count);
+  if (!display_count ||
+      get_displays(physical_device, &display_count, displays.data()) < VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: no display reported by the driver");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  const VkDisplayPropertiesKHR& display = displays[0];
+  REXLOG_INFO("VulkanPresenter: {} display(s); using '{}', {}x{}", display_count,
+              display.displayName ? display.displayName : "",
+              display.physicalResolution.width, display.physicalResolution.height);
+
+  uint32_t mode_count = 0;
+  get_modes(physical_device, display.display, &mode_count, nullptr);
+  std::vector<VkDisplayModePropertiesKHR> modes(mode_count);
+  if (!mode_count ||
+      get_modes(physical_device, display.display, &mode_count, modes.data()) < VK_SUCCESS) {
+    REXLOG_ERROR("VulkanPresenter: the display reports no modes");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  const VkDisplayModePropertiesKHR* chosen = nullptr;
+  for (const VkDisplayModePropertiesKHR& mode : modes) {
+    REXLOG_INFO("VulkanPresenter: display mode {}x{} at {} mHz", mode.parameters.visibleRegion.width,
+                mode.parameters.visibleRegion.height, mode.parameters.refreshRate);
+    if (!chosen && mode.parameters.visibleRegion.width == width &&
+        mode.parameters.visibleRegion.height == height) {
+      chosen = &mode;
+    }
+  }
+  if (!chosen) {
+    chosen = &modes[0];
+    REXLOG_WARN("VulkanPresenter: no {}x{} display mode; using the first one", width, height);
+  }
+
+  uint32_t plane_count = 0;
+  get_planes(physical_device, &plane_count, nullptr);
+  if (!plane_count) {
+    REXLOG_ERROR("VulkanPresenter: the driver reports no display planes");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  VkDisplaySurfaceCreateInfoKHR create_info = {};
+  create_info.sType = VK_STRUCTURE_TYPE_DISPLAY_SURFACE_CREATE_INFO_KHR;
+  create_info.displayMode = chosen->displayMode;
+  create_info.planeIndex = 0;
+  create_info.planeStackIndex = 0;
+  create_info.transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+  create_info.globalAlpha = 1.0f;
+  create_info.alphaMode = VK_DISPLAY_PLANE_ALPHA_OPAQUE_BIT_KHR;
+  create_info.imageExtent = chosen->parameters.visibleRegion;
+  const VkResult result = create_surface(instance, &create_info, nullptr, surface_out);
+  REXLOG_INFO("VulkanPresenter: display surface {}x{} at {} mHz, {} plane(s): result {}",
+              create_info.imageExtent.width, create_info.imageExtent.height,
+              chosen->parameters.refreshRate, plane_count, static_cast<int>(result));
+  return result;
+}
+
+}  // namespace
+#endif  // REX_PLATFORM_PS5
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -444,6 +538,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #if REX_PLATFORM_MAC
   if (instance_extensions.ext_EXT_metal_surface) {
     type_flags |= Surface::kTypeFlag_CAMetalLayer;
+  }
+#endif
+#if REX_PLATFORM_PS5
+  if (instance_extensions.ext_KHR_display) {
+    type_flags |= Surface::kTypeFlag_Ps5Display;
   }
 #endif
   return type_flags;
@@ -856,6 +955,13 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.pLayer = metal_surface.layer();
         vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_PS5
+      case Surface::kTypeIndex_Ps5Display: {
+        vulkan_surface_create_result = CreatePs5DisplaySurface(
+            ifn.vkGetInstanceProcAddr, instance, vulkan_device_->physical_device(),
+            new_surface_width, new_surface_height, &paint_context_.vulkan_surface);
       } break;
 #endif
       default:
@@ -1490,6 +1596,7 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+  image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;  // VR fork: the HUD split's scene copy
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
@@ -1529,6 +1636,20 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  if (!vr::DesktopMirror()) {  // VR fork: no desktop window presents in VR unless asked for (vr_desktop_mirror)
+    return PaintResult::kNotPresented;
+  }
+#if REX_PLATFORM_PS5
+  // Nothing can be seen of presentation on the console except the screen, so
+  // the first few paints and then one in every 300 are logged: that it was
+  // entered, what acquire returned, what present returned.
+  const uint64_t ps5_paint_index = g_ps5_paint_count.fetch_add(1, std::memory_order_relaxed);
+  const bool ps5_log_paint = ps5_paint_index < 6 || ps5_paint_index % 300 == 0;
+  if (ps5_log_paint) {
+    REXLOG_INFO("VulkanPresenter: paint {} begins (UI drawers {})", ps5_paint_index,
+                execute_ui_drawers);
+  }
+#endif
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
@@ -1572,6 +1693,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
+#if REX_PLATFORM_PS5
+  if (ps5_log_paint) {
+    REXLOG_INFO("VulkanPresenter: paint {} acquire returned {}, image {}", ps5_paint_index,
+                static_cast<int>(acquire_result), swapchain_image_index);
+  }
+#endif
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -2242,6 +2369,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
   }
+#if REX_PLATFORM_PS5
+  if (ps5_log_paint) {
+    REXLOG_INFO("VulkanPresenter: paint {} present returned {}", ps5_paint_index,
+                static_cast<int>(present_result));
+  }
+#endif
   switch (present_result) {
     case VK_SUCCESS:
       return PaintResult::kPresented;

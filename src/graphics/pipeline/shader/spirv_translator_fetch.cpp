@@ -93,6 +93,29 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
     }
     // Store the address for the subsequent vfetch_mini.
     builder_->createStore(address, var_main_vfetch_address_);
+    // VR fork (VrBillboardShader): the card's centre, the first 3 floats at offset 0.
+    if (vr_billboard_ != VrBillboard::kNone && !vr_billboard_centre_stored_ && !instr.attributes.offset &&
+        instr.attributes.data_format == xenos::VertexFormat::k_32_32_32_FLOAT) {
+      vr_billboard_centre_stored_ = true;
+      spv::Id centre_words[3];
+      for (int i = 0; i < 3; ++i) {
+        centre_words[i] = LoadUint32FromSharedMemory(
+            i ? builder_->createBinOp(spv::OpIAdd, type_int_, address, builder_->makeIntConstant(i)) : address);
+      }
+      id_vector_temp_.assign(centre_words, centre_words + 3);
+      spv::Id centre = builder_->createCompositeConstruct(type_uint3_, id_vector_temp_);
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(const_int_0_);
+      id_vector_temp_.push_back(builder_->makeIntConstant(int((fetch_constant_word_0_index + 1) >> 2)));
+      id_vector_temp_.push_back(builder_->makeIntConstant(int((fetch_constant_word_0_index + 1) & 3)));
+      const spv::Id fetch_constant_word_1 = builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassUniform, uniform_fetch_constants_, id_vector_temp_),
+          spv::NoPrecision);
+      centre = EndianSwap32Uint(centre, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
+                                                              builder_->makeUintConstant(0b11)));
+      builder_->createStore(builder_->createUnaryOp(spv::OpBitcast, type_float3_, centre),
+                            var_main_vr_billboard_centre_);
+    }
   }
 
   if (!needed_words) {
@@ -647,21 +670,18 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
       sampler = builder_->createLoad(sampler_bindings_[sampler_index].variable, spv::NoPrecision);
       const TextureBinding& image_2d_array_or_cube_unsigned_binding =
           texture_bindings_[image_2d_array_or_cube_unsigned_index];
-      image_2d_array_or_cube_unsigned =
-          builder_->createLoad(image_2d_array_or_cube_unsigned_binding.variable, spv::NoPrecision);
+      image_2d_array_or_cube_unsigned = LoadTextureBinding(image_2d_array_or_cube_unsigned_binding);
       const TextureBinding& image_2d_array_or_cube_signed_binding =
           texture_bindings_[image_2d_array_or_cube_signed_index];
-      image_2d_array_or_cube_signed =
-          builder_->createLoad(image_2d_array_or_cube_signed_binding.variable, spv::NoPrecision);
+      image_2d_array_or_cube_signed = LoadTextureBinding(image_2d_array_or_cube_signed_binding);
       if (image_3d_unsigned_index != SIZE_MAX) {
         const TextureBinding& image_3d_unsigned_binding =
             texture_bindings_[image_3d_unsigned_index];
-        image_3d_unsigned =
-            builder_->createLoad(image_3d_unsigned_binding.variable, spv::NoPrecision);
+        image_3d_unsigned = LoadTextureBinding(image_3d_unsigned_binding);
       }
       if (image_3d_signed_index != SIZE_MAX) {
         const TextureBinding& image_3d_signed_binding = texture_bindings_[image_3d_signed_index];
-        image_3d_signed = builder_->createLoad(image_3d_signed_binding.variable, spv::NoPrecision);
+        image_3d_signed = LoadTextureBinding(image_3d_signed_binding);
       }
     }
 
@@ -2084,6 +2104,24 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
   StoreResult(instr.result, result_vector);
 }
 
+// VR fork: a texture binding's image; multiview, a pixel shader's binding holds both eyes' views, the view's taken.
+spv::Id SpirvShaderTranslator::LoadTextureBinding(const TextureBinding& binding) {
+  if (!is_pixel_shader() || vr_view_index_ == spv::NoResult) {
+    return builder_->createLoad(binding.variable, spv::NoPrecision);
+  }
+  builder_->addCapability(spv::CapabilityShaderNonUniform);
+  builder_->addCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+  spv::Id index = builder_->createLoad(vr_view_index_, spv::NoPrecision);
+  builder_->addDecoration(index, spv::DecorationNonUniform);
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(index);
+  spv::Id element = builder_->createAccessChain(spv::StorageClassUniformConstant, binding.variable, id_vector_temp_);
+  builder_->addDecoration(element, spv::DecorationNonUniform);
+  spv::Id image = builder_->createLoad(element, spv::NoPrecision);
+  builder_->addDecoration(image, spv::DecorationNonUniform);
+  return image;
+}
+
 size_t SpirvShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
                                                       xenos::FetchOpDimension dimension,
                                                       bool is_signed) {
@@ -2125,10 +2163,14 @@ size_t SpirvShaderTranslator::FindOrAddTextureBinding(uint32_t fetch_constant,
       is_array = true;
       dimension_name = "2d";
   }
+  spv::Id type_image = builder_->makeImageType(type_float_, type_dimension, false, is_array, false, 1,
+                                               spv::ImageFormatUnknown);
+  if (is_pixel_shader() && vr_view_index_ != spv::NoResult) {
+    // VR fork, multiview: both eyes' views of the texture (LoadTextureBinding takes the view's).
+    type_image = builder_->makeArrayType(type_image, builder_->makeUintConstant(2), 0);
+  }
   new_texture_binding.variable = builder_->createVariable(
-      spv::NoPrecision, spv::StorageClassUniformConstant,
-      builder_->makeImageType(type_float_, type_dimension, false, is_array, false, 1,
-                              spv::ImageFormatUnknown),
+      spv::NoPrecision, spv::StorageClassUniformConstant, type_image,
       fmt::format("xe_texture{}_{}_{}", fetch_constant, dimension_name, is_signed ? 's' : 'u')
           .c_str());
   builder_->addDecoration(

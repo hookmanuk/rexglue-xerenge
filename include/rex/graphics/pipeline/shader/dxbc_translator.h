@@ -237,6 +237,20 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // should be safe at least temporarily).
     kSysFlag_ROVDepthStencilEarlyWrite_Shift,
 
+    // MCLA (lighting work): the Xenos applies the source blend factor in the MIN and MAX
+    // blend equations as well; Direct3D 12 and Vulkan ignore the factors there. With these
+    // set (host render target path), the pixel shader multiplies its colour / its alpha for
+    // that render target by its (saturated) alpha itself: the SrcAlpha source factor of a
+    // MIN / MAX blend whose destination factor is One. See REFLECTION_FIX.md in the project root.
+    kSysFlag_MinMaxColor0TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxColor1TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxColor2TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxColor3TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha0TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha1TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha2TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha3TimesSrcAlpha_Shift,
+
     kSysFlag_Count,
 
     kSysFlag_SharedMemoryIsUAV = 1u << kSysFlag_SharedMemoryIsUAV_Shift,
@@ -260,6 +274,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    kSysFlag_MinMaxColor0TimesSrcAlpha = 1u << kSysFlag_MinMaxColor0TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha0TimesSrcAlpha = 1u << kSysFlag_MinMaxAlpha0TimesSrcAlpha_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

@@ -15,6 +15,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include <rex/ui/vulkan/vr_openxr.h>
+#include <rex/ui/vulkan/vr_twins.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -217,6 +219,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
     // #141.
     XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
+    if (std::getenv("MCLA_VR_VRS_TEST")) {  // VR fork, development: a fixed shading rate for the game's draws
+      XE_UI_VULKAN_STRUCT_EXTENSION(KHR_fragment_shading_rate)
+    }
     // #148.
     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
     if (get_physical_device_properties2_supported) {
@@ -282,6 +287,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
+  // VR fork: the OpenXR runtime's device extensions.
+  if (with_swapchain && vr::Active()) {
+    for (const char* name : vr::DeviceExtensions(vulkan_instance->functions().vkGetInstanceProcAddr,
+                                                 vulkan_instance->instance(), physical_device)) {
+      if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                       [name](const char* e) { return std::strcmp(e, name) == 0; })) {
+        enabled_extensions.push_back(name);
+      }
+    }
+  }
+
   if (with_swapchain && !device->extensions_.ext_KHR_swapchain) {
     REXLOG_WARN("Vulkan device '{}' doesn't support swapchains", properties.deviceName);
     return nullptr;
@@ -302,6 +318,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 
+  VulkanFeatures<VkPhysicalDeviceVulkan11Features,  // VR fork: multiview
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>
+      features_1_1;
   VulkanFeatures<VkPhysicalDeviceVulkan12Features,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>
       features_1_2;
@@ -335,9 +354,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
+  VulkanFeatures<VkPhysicalDeviceFragmentShadingRateFeaturesKHR,  // VR fork, development (MCLA_VR_VRS_TEST)
+                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR>
+      features_KHR_fragment_shading_rate;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
+      features_1_1.Link(supported_features_2, device_create_info);
       features_1_2.Link(supported_features_2, device_create_info);
     }
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 3, 0)) {
@@ -375,6 +398,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
+    }
+    if (device->extensions_.ext_KHR_fragment_shading_rate) {
+      features_KHR_fragment_shading_rate.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -480,6 +506,13 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   device->queue_families_[device->queue_family_graphics_compute_].queues.resize(std::max(
       size_t(1), device->queue_families_[device->queue_family_graphics_compute_].queues.size()));
+  if (with_swapchain && vr::Active()) {  // VR fork: the headset's own queue
+    auto& graphics_queues = device->queue_families_[device->queue_family_graphics_compute_].queues;
+    graphics_queues.resize(vr::QueueCount(vulkan_instance->functions().vkGetInstanceProcAddr,
+                                          vulkan_instance->instance(), physical_device,
+                                          device->queue_family_graphics_compute_,
+                                          uint32_t(graphics_queues.size())));
+  }
   if (device->queue_family_sparse_binding_ != UINT32_MAX) {
     device->queue_families_[device->queue_family_sparse_binding_].queues.resize(std::max(
         size_t(1), device->queue_families_[device->queue_family_sparse_binding_].queues.size()));
@@ -650,6 +683,24 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       XE_UI_VULKAN_FEATURE_2(features_1_2, samplerMirrorClampToEdge);
       XE_UI_VULKAN_FEATURE_2(features_1_2, uniformBufferStandardLayout);
       XE_UI_VULKAN_FEATURE_2(features_1_2, scalarBlockLayout);
+    }
+    if (with_swapchain && vr::Active()) {  // VR fork: the headset's frames are published with a timeline
+      features_1_2.enabled.timelineSemaphore = features_1_2.supported.timelineSemaphore;
+      features_1_2.enabled.bufferDeviceAddress = features_1_2.supported.bufferDeviceAddress;  // DLSS (NGX)
+      // Multiview stereo: both eyes in a pass, a pixel shader's textures picked by the view.
+      features_1_1.enabled.multiview = features_1_1.supported.multiview;
+      features_1_1.enabled.multiviewGeometryShader = features_1_1.supported.multiviewGeometryShader;
+      features_1_2.enabled.shaderSampledImageArrayNonUniformIndexing =
+          features_1_2.supported.shaderSampledImageArrayNonUniformIndexing;
+      if (device->extensions_.ext_KHR_fragment_shading_rate) {  // development: MCLA_VR_VRS_TEST
+        features_KHR_fragment_shading_rate.enabled.pipelineFragmentShadingRate =
+            features_KHR_fragment_shading_rate.supported.pipelineFragmentShadingRate;
+        REXLOG_INFO("* VR: pipeline fragment shading rate {}",
+                    bool(features_KHR_fragment_shading_rate.supported.pipelineFragmentShadingRate));
+      }
+      REXLOG_INFO("* VR: multiview {} (geometry shaders {}), sampled image non-uniform indexing {}",
+                  bool(features_1_1.supported.multiview), bool(features_1_1.supported.multiviewGeometryShader),
+                  bool(features_1_2.supported.shaderSampledImageArrayNonUniformIndexing));
     }
   } else {
     if (ext_1_2_KHR_sampler_mirror_clamp_to_edge) {
@@ -846,6 +897,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (memory_type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
       device->memory_types_.host_cached |= memory_type_bit;
     }
+  }
+
+  if (with_swapchain) {  // VR fork: the right eye's twins (stereo)
+    vr::InstallTwins(device->functions_, device->memory_types_.host_visible);
+  }
+  if (with_swapchain) {  // VR fork: the OpenXR session on this device
+    vr::OnDeviceCreated(device.get(), vulkan_instance->functions().vkGetInstanceProcAddr,
+                        vulkan_instance->instance(), physical_device, device->device_,
+                        device->queue_family_graphics_compute_);
   }
 
   return device;

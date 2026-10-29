@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstdlib>
 #include <algorithm>
 #include <cstdint>
 
@@ -52,6 +53,16 @@ inline uint32_t ChooseHostMemoryType(const VulkanDevice::MemoryTypes& memory_typ
                                      uint32_t supported_types, const bool is_readback) {
   supported_types &= memory_types.host_visible;
   uint32_t memory_type;
+  // VR fork: uploads in device-local host-visible memory (resizable BAR) where it exists, so the GPU reads them at
+  // VRAM speed instead of over PCIe for every draw (MCLA_UPLOAD_VRAM=0: system memory as before).
+  static const bool upload_vram = [] {
+    const char* v = std::getenv("MCLA_UPLOAD_VRAM");
+    return !v || v[0] != '0';
+  }();
+  if (!is_readback && upload_vram &&
+      rex::bit_scan_forward(supported_types & memory_types.device_local, &memory_type)) {
+    return memory_type;
+  }
   // For upload, uncached is preferred so writes do not pollute the CPU cache.
   // For readback, cached is preferred so multiple CPU reads are fast.
   // If the preferred caching behavior is not available, pick any host-visible.

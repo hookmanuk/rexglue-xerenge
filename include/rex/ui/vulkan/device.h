@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -184,6 +185,7 @@ class VulkanDevice {
     bool ext_KHR_swapchain = false;                     // #2
     bool ext_1_1_KHR_dedicated_allocation = false;      // #128
     bool ext_EXT_shader_stencil_export = false;         // #141
+    bool ext_KHR_fragment_shading_rate = false;         // #227 (VR fork, development: MCLA_VR_VRS_TEST)
     bool ext_1_1_KHR_get_memory_requirements2 = false;  // #147
     bool ext_1_2_KHR_image_format_list = false;         // #148
     // Has optional features not implied by this being true.
@@ -274,8 +276,19 @@ class VulkanDevice {
   // May be the same as queue_family_graphics_compute().
   uint32_t queue_family_sparse_binding() const { return queue_family_sparse_binding_; }
 
+  // VR fork: work handed to a submission thread (the Vulkan command processor's) reaches the queue before any
+  // other use of it: AcquireQueue runs this hook first, except on that thread (QueueAcquireExempt).
+  static inline std::atomic<void (*)()> before_queue_acquire{nullptr};
+  static bool& QueueAcquireExempt() {
+    static thread_local bool exempt = false;
+    return exempt;
+  }
+
   Queue::Acquisition AcquireQueue(const uint32_t queue_family_index,
                                   const uint32_t queue_index) const {
+    if (void (*hook)() = before_queue_acquire.load(std::memory_order_acquire); hook && !QueueAcquireExempt()) {
+      hook();
+    }
     return queue_families()[queue_family_index].queues[queue_index]->Acquire();
   }
 

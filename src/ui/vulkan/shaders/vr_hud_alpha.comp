@@ -1,0 +1,22 @@
+#version 450
+// VR fork: the HUD layer. The game blends its HUD over the scene in gamma space; a compositor blends layers in linear
+// light. With alpha A' = 1 - (1 - A)^2.2 the scene shows through as much as in the game's frame (the HUD drawn over
+// transparent black: colour premultiplied, A its coverage). Channels swapped for a BGRA swapchain (the result is
+// copied into it bit for bit).
+// glslangValidator -V --target-env vulkan1.1 -x -o vr_hud_alpha.inc vr_hud_alpha.comp
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0, rgba8) uniform readonly image2D source;
+layout(binding = 1, rgba8) uniform writeonly image2D target;
+layout(push_constant) uniform Constants {
+  uvec2 size;
+  uint swap_red_blue;
+} constants;
+void main() {
+  const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(xy), constants.size))) {
+    return;
+  }
+  vec4 c = imageLoad(source, xy);
+  c.a = 1.0 - pow(1.0 - c.a, 2.2);
+  imageStore(target, xy, constants.swap_red_blue != 0u ? c.bgra : c);
+}

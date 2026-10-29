@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -20,6 +21,7 @@
 #include <SPIRV/GLSL.std.450.h>
 #include <fmt/format.h>
 
+#include <rex/ui/vulkan/vr_twins.h>
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
@@ -136,6 +138,11 @@ void SpirvShaderTranslator::Reset() {
   texture_bindings_.clear();
 
   main_interface_.clear();
+  push_vr_eye_ = spv::NoResult;
+  vr_object_motion_ = spv::NoResult;
+  vr_frag_coord_ = spv::NoResult;
+  vr_view_index_ = spv::NoResult;
+  vr_object_motion_right_ = spv::NoResult;
   var_main_registers_ = spv::NoResult;
   var_main_memexport_address_ = spv::NoResult;
   for (size_t memexport_eM_index = 0; memexport_eM_index < rex::countof(var_main_memexport_data_);
@@ -499,6 +506,13 @@ void SpirvShaderTranslator::StartTranslation() {
     var_main_vfetch_address_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_int_,
                                  "xe_var_vfetch_address", const_int_0_);
+    vr_billboard_ = VrBillboardShader(current_shader().type(), current_shader().ucode_data_hash());
+    vr_billboard_centre_stored_ = false;
+    if (vr_billboard_ != VrBillboard::kNone) {  // VR fork
+      var_main_vr_billboard_centre_ =
+          builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float3_,
+                                   "xe_var_vr_billboard_centre", const_float3_0_);
+    }
     var_main_tfetch_lod_ =
         builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_float_,
                                  "xe_var_tfetch_lod", const_float_0_);
@@ -1635,7 +1649,80 @@ void SpirvShaderTranslator::EnsureBuildPointAvailable() {
   builder_->setBuildPoint(&new_block);
 }
 
+// VR fork: the eye push constant (ui::vulkan::vr::EyePush): shift, jitter x, y, motion, clip_to_prev (4 rows), size,
+// tag.
+void SpirvShaderTranslator::MakeVrEyePush() {
+  id_vector_temp_.clear();
+  for (int i = 0; i < 4; ++i) {
+    id_vector_temp_.push_back(type_float_);
+  }
+  for (int i = 0; i < 4; ++i) {
+    id_vector_temp_.push_back(type_float4_);
+  }
+  id_vector_temp_.push_back(type_float2_);
+  id_vector_temp_.push_back(type_float_);
+  id_vector_temp_.push_back(type_float_);
+  spv::Id type_vr_eye = builder_->makeStructType(id_vector_temp_, "XeVrEye");
+  static const char* const kNames[] = {"shift",          "jitter_x",       "jitter_y",       "motion",
+                                       "clip_to_prev_0", "clip_to_prev_1", "clip_to_prev_2", "clip_to_prev_3",
+                                       "size",           "tag",            "shift_right"};
+  static const int kOffsets[] = {0, 4, 8, 12, 16, 32, 48, 64, 80, 88, 92};
+  for (int i = 0; i < 11; ++i) {
+    builder_->addMemberName(type_vr_eye, i, kNames[i]);
+    builder_->addMemberDecoration(type_vr_eye, i, spv::DecorationOffset, kOffsets[i]);
+  }
+  builder_->addDecoration(type_vr_eye, spv::DecorationBlock);
+  push_vr_eye_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassPushConstant, type_vr_eye, "xe_vr_eye");
+  if (features_.spirv_version >= spv::Spv_1_4) {
+    main_interface_.push_back(push_vr_eye_);
+  }
+}
+
+spv::Id SpirvShaderTranslator::LoadVrEyeMember(int member) {
+  id_vector_temp_.clear();
+  id_vector_temp_.push_back(builder_->makeIntConstant(member));
+  return builder_->createLoad(builder_->createAccessChain(spv::StorageClassPushConstant, push_vr_eye_, id_vector_temp_),
+                              spv::NoPrecision);
+}
+
+// VR fork, multiview: ViewIndex (0 the left eye, 1 the right).
+void SpirvShaderTranslator::MakeVrViewIndex() {
+  if (!ui::vulkan::vr::Multiview() || vr_view_index_ != spv::NoResult) {
+    return;
+  }
+  builder_->addCapability(spv::CapabilityMultiView);
+  if (features_.spirv_version < spv::Spv_1_3) {
+    builder_->addExtension("SPV_KHR_multiview");
+  }
+  vr_view_index_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_int_, "gl_ViewIndex");
+  builder_->addDecoration(vr_view_index_, spv::DecorationBuiltIn, spv::BuiltInViewIndex);
+  if (is_pixel_shader()) {
+    builder_->addDecoration(vr_view_index_, spv::DecorationFlat);
+  }
+  main_interface_.push_back(vr_view_index_);
+}
+
+spv::Id SpirvShaderTranslator::VrIsRightEye() {
+  return builder_->createBinOp(spv::OpINotEqual, type_bool_, builder_->createLoad(vr_view_index_, spv::NoPrecision),
+                               builder_->makeIntConstant(0));
+}
+
+// The eye's clip-space shift: multiview, the view's eye's (shift_right for the right eye).
+spv::Id SpirvShaderTranslator::LoadVrEyeShift() {
+  spv::Id shift = LoadVrEyeMember(0);
+  if (vr_view_index_ != spv::NoResult) {
+    shift = builder_->createTriOp(spv::OpSelect, type_float_, VrIsRightEye(), LoadVrEyeMember(10), shift);
+  }
+  return shift;
+}
+
 void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+  // VR fork: stereo replays each frame per eye (multiview: draws both); the eye's shift comes as a push constant.
+  if (ui::vulkan::vr::Stereo() && !IsSpirvComputeShader() && !IsSpirvTessEvalShader()) {
+    MakeVrEyePush();
+    MakeVrViewIndex();
+  }
+
   if (IsSpirvComputeShader()) {
     // For memexport fallback execution, each invocation corresponds to one
     // guest vertex processing index.
@@ -2509,6 +2596,36 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
     }
   }
 
+  // VR fork: the eye's view of perspective geometry: the camera moved along its x axis is x + P00 * offset in clip
+  // space. Screen-space draws (W 1: post-processing, the HUD) stay put.
+  if (push_vr_eye_ != spv::NoResult) {
+    spv::Id eye_shift = LoadVrEyeShift();
+    spv::Id w_distance = builder_->createUnaryBuiltinCall(
+        type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs,
+        builder_->createNoContractionBinOp(spv::OpFSub, type_float_, position_w, const_float_1_));
+    spv::Id is_perspective = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, w_distance,
+                                                   builder_->makeFloatConstant(1.0f / 1024.0f));
+    // DLSS's jitter: a sub-pixel move of the picture, w times its NDC offset in clip space.
+    const auto load_member = [&](int member) {
+      id_vector_temp_.clear();
+      id_vector_temp_.push_back(builder_->makeIntConstant(member));
+      return builder_->createLoad(
+          builder_->createAccessChain(spv::StorageClassPushConstant, push_vr_eye_, id_vector_temp_),
+          spv::NoPrecision);
+    };
+    spv::Id jitter_x = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, load_member(1), position_w);
+    spv::Id jitter_y = builder_->createNoContractionBinOp(spv::OpFMul, type_float_, load_member(2), position_w);
+    eye_shift = builder_->createNoContractionBinOp(spv::OpFAdd, type_float_, eye_shift, jitter_x);
+    eye_shift = builder_->createTriOp(spv::OpSelect, type_float_, is_perspective, eye_shift, const_float_0_);
+    jitter_y = builder_->createTriOp(spv::OpSelect, type_float_, is_perspective, jitter_y, const_float_0_);
+    spv::Id position_x = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_, builder_->createCompositeExtract(position_xyz, type_float_, 0), eye_shift);
+    position_xyz = builder_->createCompositeInsert(position_x, position_xyz, type_float3_, 0);
+    spv::Id position_y = builder_->createNoContractionBinOp(
+        spv::OpFAdd, type_float_, builder_->createCompositeExtract(position_xyz, type_float_, 1), jitter_y);
+    position_xyz = builder_->createCompositeInsert(position_y, position_xyz, type_float3_, 1);
+  }
+
   uint32_t clip_distance_next_component = 0;
   uint32_t cull_distance_next_component = 0;
   // Clip against user clip planes.
@@ -2817,6 +2934,27 @@ void SpirvShaderTranslator::CompleteVertexOrTessEvalShaderInMain() {
 }
 
 void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
+  // VR fork: DLSS's object motion (the draw's own, stored per pixel; vr_dlss).
+  if (ui::vulkan::vr::Stereo()) {
+    MakeVrViewIndex();  // (multiview: the textures' eye)
+  }
+  if (ui::vulkan::vr::Stereo() && !is_depth_only_fragment_shader_) {
+    MakeVrEyePush();
+    spv::Id type_image = builder_->makeImageType(type_float_, spv::Dim2D, false, false, false, 2,
+                                                 spv::ImageFormatRgba32f);
+    // Multiview: the right eye's at binding 3.
+    for (int eye = 0; eye < (vr_view_index_ != spv::NoResult ? 2 : 1); ++eye) {
+      spv::Id& motion = eye ? vr_object_motion_right_ : vr_object_motion_;
+      motion = builder_->createVariable(spv::NoPrecision, spv::StorageClassUniformConstant, type_image,
+                                        eye ? "xe_vr_motion_right" : "xe_vr_motion");
+      builder_->addDecoration(motion, spv::DecorationDescriptorSet, int(kDescriptorSetSharedMemoryAndEdram));
+      builder_->addDecoration(motion, spv::DecorationBinding, 2 + eye);
+      builder_->addDecoration(motion, spv::DecorationNonReadable);
+      if (features_.spirv_version >= spv::Spv_1_4) {
+        main_interface_.push_back(motion);
+      }
+    }
+  }
   Modification shader_modification = GetSpirvShaderModification();
 
   if (edram_fragment_shader_interlock_) {
@@ -2907,6 +3045,14 @@ void SpirvShaderTranslator::StartFragmentShaderBeforeMain() {
     builder_->addDecoration(input_fragment_coordinates_, spv::DecorationBuiltIn,
                             spv::BuiltInFragCoord);
     main_interface_.push_back(input_fragment_coordinates_);
+  }
+  // VR fork: the object motion's pixel (the shader's own FragCoord, or one for it alone).
+  vr_frag_coord_ = input_fragment_coordinates_;
+  if (vr_object_motion_ != spv::NoResult && vr_frag_coord_ == spv::NoResult) {
+    vr_frag_coord_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassInput, type_float4_,
+                                              "gl_FragCoord");
+    builder_->addDecoration(vr_frag_coord_, spv::DecorationBuiltIn, spv::BuiltInFragCoord);
+    main_interface_.push_back(vr_frag_coord_);
   }
 
   // Is front facing.
@@ -3496,7 +3642,91 @@ spv::Id SpirvShaderTranslator::GetStorageAddressingIndex(
   return index;
 }
 
+// VR fork: a camera-facing card's axis (kHorizontalAxes: c208, the camera's right, level, or c209, its up made level)
+// for a camera at c15 looking at the card's anchor (in the world: through c0-c3): the same at any head pose. Seen from
+// steeply above or below (the minimap's camera, 7 km up) the game's own axes.
+spv::Id SpirvShaderTranslator::VrBillboardAxis(uint32_t constant) {
+  const Shader::ConstantRegisterMap& map = current_shader().constant_register_map();
+  auto load_constant = [&](uint32_t index) {
+    id_vector_temp_util_.clear();
+    id_vector_temp_util_.push_back(const_int_0_);
+    id_vector_temp_util_.push_back(builder_->makeIntConstant(int(map.GetPackedFloatConstantIndex(index))));
+    return builder_->createLoad(
+        builder_->createAccessChain(spv::StorageClassUniform, uniform_float_constants_, id_vector_temp_util_),
+        spv::NoPrecision);
+  };
+  auto component = [&](spv::Id vector, unsigned int i) {
+    return builder_->createCompositeExtract(vector, type_float_, i);
+  };
+  auto binary = [&](spv::Op op, spv::Id a, spv::Id b) { return builder_->createBinOp(op, type_float_, a, b); };
+  const spv::Id original = load_constant(constant);
+  uint_vector_temp_util_.assign({0, 1, 2});
+  const spv::Id camera =
+      builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, load_constant(15), uint_vector_temp_util_);
+  spv::Id centre = builder_->createLoad(var_main_vr_billboard_centre_, spv::NoPrecision);
+  {
+    spv::Id world = builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, load_constant(3),
+                                                  uint_vector_temp_util_);
+    for (unsigned int i = 0; i < 3; ++i) {
+      world = builder_->createBinOp(
+          spv::OpFAdd, type_float3_, world,
+          builder_->createBinOp(spv::OpVectorTimesScalar, type_float3_,
+                                builder_->createRvalueSwizzle(spv::NoPrecision, type_float3_, load_constant(i),
+                                                              uint_vector_temp_util_),
+                                component(centre, i)));
+    }
+    centre = world;
+  }
+  // Within ~72 degrees of level (false for NaN: a zero direction).
+  auto level_enough = [&](spv::Id direction) {
+    return builder_->createBinOp(
+        spv::OpFOrdLessThan, type_bool_,
+        builder_->createUnaryBuiltinCall(type_float_, ext_inst_glsl_std_450_, GLSLstd450FAbs, component(direction, 1)),
+        builder_->makeFloatConstant(0.95f));
+  };
+  // The game sets c208 = k x the camera's right (level) and c209 = k x its up made level (k sin(pitch) along the
+  // level forward); the same for a camera looking from c15 at the anchor: d its direction, g = d made level:
+  // c208 = k (-g.z, 0, g.x), c209 = k (-d.y) g.
+  const spv::Id d = builder_->createUnaryBuiltinCall(
+      type_float3_, ext_inst_glsl_std_450_, GLSLstd450Normalize,
+      builder_->createBinOp(spv::OpFSub, type_float3_, centre, camera));
+  id_vector_temp_util_.assign({component(d, 0), component(d, 2)});
+  const spv::Id g = builder_->createUnaryBuiltinCall(
+      type_float2_, ext_inst_glsl_std_450_, GLSLstd450Normalize,
+      builder_->createCompositeConstruct(type_float2_, id_vector_temp_util_));
+  const spv::Id across = load_constant(208);
+  uint_vector_temp_util_.assign({0, 2});
+  const spv::Id k = builder_->createUnaryBuiltinCall(
+      type_float_, ext_inst_glsl_std_450_, GLSLstd450Length,
+      builder_->createRvalueSwizzle(spv::NoPrecision, type_float2_, across, uint_vector_temp_util_));
+  spv::Id x, z;
+  if (constant == 208) {
+    x = binary(spv::OpFMul, k, builder_->createUnaryOp(spv::OpFNegate, type_float_, component(g, 1)));
+    z = binary(spv::OpFMul, k, component(g, 0));
+  } else {
+    const spv::Id tilt =
+        binary(spv::OpFMul, k, builder_->createUnaryOp(spv::OpFNegate, type_float_, component(d, 1)));
+    x = binary(spv::OpFMul, tilt, component(g, 0));
+    z = binary(spv::OpFMul, tilt, component(g, 1));
+  }
+  id_vector_temp_util_.assign({x, component(original, 1), z, component(original, 3)});
+  // Only when asked per draw: c208.w (unused by the game) is 1 for facing cards (the renderer's vr_foliage), else the
+  // constants as given (fixed cards: the game camera's axes, or the game's own).
+  const spv::Id wanted = builder_->createBinOp(spv::OpFOrdGreaterThan, type_bool_, component(across, 3),
+                                               builder_->makeFloatConstant(0.5f));
+  return builder_->createTriOp(spv::OpSelect, type_float4_,
+                               builder_->createBinOp(spv::OpLogicalAnd, type_bool_, level_enough(d), wanted),
+                               builder_->createCompositeConstruct(type_float4_, id_vector_temp_util_), original);
+}
+
 spv::Id SpirvShaderTranslator::LoadOperandStorage(const InstructionOperand& operand) {
+  if (vr_billboard_ != VrBillboard::kNone && vr_billboard_centre_stored_ &&  // VR fork
+      operand.storage_source == InstructionStorageSource::kConstantFloat &&
+      operand.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute &&
+      (operand.storage_index == 208 || operand.storage_index == 209)) {
+    EnsureBuildPointAvailable();
+    return VrBillboardAxis(operand.storage_index);
+  }
   spv::Id index =
       GetStorageAddressingIndex(operand.storage_addressing_mode, operand.storage_index,
                                 operand.storage_source == InstructionStorageSource::kConstantFloat);

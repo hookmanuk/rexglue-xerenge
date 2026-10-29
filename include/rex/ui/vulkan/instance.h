@@ -91,6 +91,9 @@ class VulkanInstance {
   // supported (with the `ext_major_minor_` prefix rather than `ext_`).
   struct Extensions {
     bool ext_KHR_surface = false;  // #1
+#if REX_PLATFORM_PS5
+    bool ext_KHR_display = false;  // #3
+#endif
 #ifdef VK_USE_PLATFORM_XCB_KHR
     bool ext_KHR_xcb_surface = false;  // #6
 #endif

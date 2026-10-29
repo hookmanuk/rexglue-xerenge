@@ -10,14 +10,18 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <bitset>
 #include <array>
 #include <climits>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -47,6 +51,36 @@ namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor : public CommandProcessor {
  public:
+  // VR fork, development: the frame VR_LOG_FRAME names (draw and resolve logs).
+  bool VrLogThisFrame() const;
+  bool VrHeadTrackedProjection(const float* world, const float* world_view_projection) const;
+  // VR fork: D3D's clear quad: the rectangle it writes whole, and which targets (bit 0 depth, 1 + n colour n).
+  bool VrClearCutout(const Shader& vertex_shader, uint32_t normalized_color_mask,
+                     reg::RB_DEPTHCONTROL normalized_depth_control, VulkanRenderTargetCache::VrRect& rect,
+                     uint32_t& targets) const;
+  bool VrHudDraw(const Shader* vertex_shader);
+  int VrScaledEdges() const;
+  uint32_t vr_log_swap_count_ = 0;
+  bool vr_frame_scene_ = false;  // VR fork: the frame drew a head-tracked 3D scene (else on the screen, unposed)
+  uint32_t vr_log_draw_index_ = 0;
+  // VR fork: the HUD layer (ui::vulkan::vr::SplitFrame): the frame's split, its target, the last output's size.
+  int vr_hud_screen_ = -1;
+  bool vr_hud_copy_pending_ = false;
+  uint32_t vr_hud_base_ = 0, vr_hud_pitch_ = 0;
+  const void* vr_hud_target_ = nullptr;
+  uint32_t vr_output_width_ = 0, vr_output_height_ = 0;
+  VkImage vr_motion_image_ = VK_NULL_HANDLE;  // VR fork: DLSS's object motion (set 0, binding 2)
+  VkDeviceMemory vr_motion_memory_ = VK_NULL_HANDLE;
+  VkImageView vr_motion_view_ = VK_NULL_HANDLE;
+  bool vr_motion_prepared_ = false;
+  // VR fork (stereo): which draws differ between the eyes. A perspective draw (its world-view-projection, RAGE's
+  // c8-c11, has a w column) gets the eye shift; a draw is eye-dependent if perspective or sampling an eye-dependent
+  // texture; render targets an eye-dependent draw wrote (by EDRAM base) are; their resolves' pages are.
+  bool vr_vertex_textures_eye_ = false, vr_pixel_textures_eye_ = false;
+  std::bitset<4096> vr_eye_targets_;
+  void VrDrawMatrix(bool world_view_projection, float (&out)[16]) const;
+  bool VrDrawIsPerspective() const;
+
   // Single-descriptor layouts for use within a single frame.
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
@@ -501,6 +535,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns how many VkWriteDescriptorSet structure instances have been
   // written, or 0 if there was a failure to allocate the descriptor set or no
   // bindings were requested.
+  void VrDynamicConstants(uint32_t updated);  // VR fork
   uint32_t WriteTransientTextureBindings(bool is_vertex, uint32_t texture_count,
                                          uint32_t sampler_count,
                                          VkDescriptorSetLayout descriptor_set_layout,
@@ -553,6 +588,52 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
   DeferredCommandBuffer deferred_command_buffer_;
 
+  // VR fork: submissions are replayed into their command buffer and submitted on a thread of their own, so the
+  // driver's work overlaps the next commands' processing (MCLA free roam: 4.9 ms of a 19 ms frame on this thread).
+  // VulkanDevice::AcquireQueue waits for the queue of them (FlushSubmissionThread). VULKAN_ASYNC_SUBMIT=0: inline.
+  struct SubmissionJob {
+    std::vector<uintmax_t> stream;
+    CommandBuffer command_buffer;
+    std::vector<VkSemaphore> wait_semaphores;
+    std::vector<VkPipelineStageFlags> wait_stage_masks;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore vr_semaphore = VK_NULL_HANDLE;  // VR fork: a timeline to signal (the headset's frame), and its value
+    uint64_t vr_value = 0;
+    uint64_t submission = 0;  // its index (GetCurrentSubmission when ended)
+  };
+  void SubmissionThreadMain();
+  bool RunSubmissionJob(SubmissionJob& job);
+  void FlushSubmissionThread();
+  static void FlushSubmissionThreadHook();
+  bool async_submit_ = false;
+  std::thread submission_thread_;
+  std::mutex submission_mutex_;
+  std::condition_variable submission_cv_;
+  std::condition_variable submission_idle_cv_;
+  std::deque<SubmissionJob> submission_jobs_;
+  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  bool submission_busy_ = false;
+  // Development: the newest submission handed to the queue (the stall log).
+  std::atomic<uint64_t> submitted_submission_{0};
+  uint32_t vr_last_job_waits_ = 0;  // development (the stall log)
+  bool submission_stop_ = false;
+  // VR fork, development: each submission's GPU time (timestamps at its command buffer's start and end), read back a
+  // ring's length later (submission thread only); the FPS log reports the GPU's busy time per frame.
+  static constexpr uint32_t kGpuTimerSlots = 65536;
+  VkQueryPool gpu_timer_pool_ = VK_NULL_HANDLE;
+  uint32_t gpu_timer_next_ = 0;
+  double gpu_timer_ns_per_tick_ = 1.0;
+  struct GpuTimedSubmission {
+    uint32_t first_slot;
+    std::vector<uint32_t> categories;  // the category of each stamp's following span (the last: unused)
+  };
+  std::deque<GpuTimedSubmission> gpu_timed_;
+  GpuTimedSubmission* gpu_timing_current_ = nullptr;
+  VkCommandBuffer gpu_timing_command_buffer_ = VK_NULL_HANDLE;
+  uint32_t GpuTimerSlotsInUse() const;
+  void GpuTimerStamp(VkCommandBuffer command_buffer, uint32_t category);
+  void GpuTimerCollect(bool all);
+
   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
   std::vector<SparseBufferBind> sparse_buffer_binds_;
   // SparseBufferBind converted to VkSparseBufferMemoryBindInfo to this buffer
@@ -566,6 +647,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Temporary storage with reusable memory for writing image and sampler
   // descriptors.
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
+  std::vector<VkDescriptorImageInfo> vr_right_texture_infos_;  // VR fork: the right eye's pushed pixel textures
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
@@ -598,6 +680,14 @@ class VulkanCommandProcessor : public CommandProcessor {
   // <Usage frame, set>.
   std::deque<std::pair<uint64_t, VkDescriptorSet>> constants_transient_descriptors_used_;
   std::vector<VkDescriptorSet> constants_transient_descriptors_free_;
+  // VR fork: the guest constants as dynamic uniform buffers (VR; MCLA_VR_DYNAMIC_CONSTANTS=0 reverts): a draw's
+  // constants move by their offsets, the set is written again only when a buffer (an upload pool page) changes.
+  static const VkDescriptorPoolSize kDescriptorPoolSizeUniformBufferDynamic;
+  ui::vulkan::LinkedTypeDescriptorSetAllocator vr_constants_dynamic_allocator_;
+  bool vr_dynamic_constants_ = false;
+  uint32_t vr_constant_offsets_[5] = {};  // SpirvShaderTranslator::kConstantBufferCount
+  VkBuffer vr_constant_set_buffers_[5] = {};
+  uint64_t vr_constant_set_frame_ = UINT64_MAX;
 
   ui::vulkan::LinkedTypeDescriptorSetAllocator transient_descriptor_allocator_textures_;
   std::deque<UsedTextureTransientDescriptorSet> texture_transient_descriptor_sets_used_;

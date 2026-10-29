@@ -21,12 +21,14 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
 
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
 
 class VulkanTextureCache final : public TextureCache {
+  friend class VulkanRenderTargetCache;  // VR fork: direct resolves write textures
  public:
   // Sampler parameters that can be directly converted to a host sampler or used
   // for checking whether samplers bindings are up to date.
@@ -193,6 +195,7 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      kComputeWrite,  // VR fork: written by a direct resolve (storage image, GENERAL)
     };
 
     // Takes ownership of the image and its memory.
@@ -211,6 +214,8 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+    // VR fork: the base level as a storage image (a direct resolve's destination), VK_NULL_HANDLE if none.
+    VkDescriptorSet VrGetStorageDescriptorSet();
 
    private:
     union ViewKey {
@@ -268,6 +273,8 @@ class VulkanTextureCache final : public TextureCache {
     std::unordered_map<ViewKey, VkImageView, ViewKey::Hasher> views_;
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+    VkImageView vr_view_storage_ = VK_NULL_HANDLE;           // VR fork
+    size_t vr_descriptor_set_index_storage_ = SIZE_MAX;      // VR fork
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
   };
 
@@ -318,6 +325,11 @@ class VulkanTextureCache final : public TextureCache {
   void ShutdownScaledResolveBuffer();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
+  // VR fork: one storage image bound to compute (a direct resolve's destination).
+  VkDescriptorSetLayout VrStorageImageDescriptorSetLayout() const {
+    return vr_descriptor_set_layout_storage_image_;
+  }
+  bool VrFormatSupportsStorage(VkFormat format) const;  // VR fork: optimal tiling, storage image
 
   void GetTextureUsageMasks(VulkanTexture::Usage usage, VkPipelineStageFlags& stage_mask,
                             VkAccessFlags& access_mask, VkImageLayout& layout);
@@ -347,6 +359,8 @@ class VulkanTextureCache final : public TextureCache {
   HostFormatPair host_formats_[64];
 
   VkPipelineLayout load_pipeline_layout_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout vr_descriptor_set_layout_storage_image_ = VK_NULL_HANDLE;  // VR fork
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> vr_descriptor_set_pool_storage_image_;
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
 

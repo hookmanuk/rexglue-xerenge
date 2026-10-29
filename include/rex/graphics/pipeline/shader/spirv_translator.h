@@ -154,6 +154,19 @@ class SpirvShaderTranslator : public ShaderTranslator {
 
     kSysFlag_Count,
 
+    // MCLA (lighting work): the Xenos applies the source blend factor in the MIN and MAX
+    // blend equations as well; Vulkan ignores the factors there. With these set, the pixel
+    // shader multiplies its colour / its alpha for that render target by its (saturated)
+    // alpha itself: the SrcAlpha source factor of a MIN / MAX blend whose destination factor
+    // is One. Host render target path only, so the eight bits share those of the FSI flags
+    // (which only that other path sets and reads) - there are not eight free ones.
+    // See REFLECTION_FIX.md in the project root.
+    kSysFlag_MinMaxColor0TimesSrcAlpha_Shift = kSysFlag_FSIDepthStencil_Shift,
+    kSysFlag_MinMaxAlpha0TimesSrcAlpha_Shift =
+        kSysFlag_MinMaxColor0TimesSrcAlpha_Shift + xenos::kMaxColorRenderTargets,
+    kSysFlag_MinMaxCount =
+        kSysFlag_MinMaxAlpha0TimesSrcAlpha_Shift + xenos::kMaxColorRenderTargets,
+
     // For HostVertexShaderType kVertex, if fullDrawIndexUint32 is not
     // supported (ignored otherwise), whether to fetch the index manually
     // (32-bit only - 16-bit indices are always fetched via the Vulkan index
@@ -199,8 +212,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSysFlag_FSIDepthWrite = 1u << kSysFlag_FSIDepthWrite_Shift,
     kSysFlag_FSIStencilTest = 1u << kSysFlag_FSIStencilTest_Shift,
     kSysFlag_FSIDepthStencilEarlyWrite = 1u << kSysFlag_FSIDepthStencilEarlyWrite_Shift,
+    kSysFlag_MinMaxColor0TimesSrcAlpha = 1u << kSysFlag_MinMaxColor0TimesSrcAlpha_Shift,
+    kSysFlag_MinMaxAlpha0TimesSrcAlpha = 1u << kSysFlag_MinMaxAlpha0TimesSrcAlpha_Shift,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
+  static_assert(kSysFlag_MinMaxCount <= 32, "Too many flags in the system constants");
 
   // For Vulkan vertex memexport compute fallback dispatches.
   static constexpr uint32_t kMemExportComputeDispatchX = 65535;
@@ -881,6 +897,21 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramBlendConstant,
   };
   spv::Id uniform_system_constants_;
+  // VR fork: the eye's clip-space shift (a push constant, stereo guest vertex shaders only).
+  spv::Id push_vr_eye_ = spv::NoResult;
+  spv::Id vr_object_motion_ = spv::NoResult;  // VR fork: DLSS's object motion image (pixel shaders)
+  spv::Id vr_frag_coord_ = spv::NoResult;
+  void MakeVrEyePush();
+  spv::Id LoadVrEyeMember(int member);
+  void StoreVrObjectMotion();
+  // VR fork, multiview: the view (eye) drawn, the eye's shift, a pixel shader texture's view of the eye, the right
+  // eye's object motion image.
+  spv::Id vr_view_index_ = spv::NoResult;
+  spv::Id vr_object_motion_right_ = spv::NoResult;
+  void MakeVrViewIndex();
+  spv::Id VrIsRightEye();
+  spv::Id LoadVrEyeShift();
+  spv::Id LoadTextureBinding(const TextureBinding& binding);
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;
@@ -967,6 +998,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // `base + index * stride` in dwords from the last vfetch_full as it may be
   // needed by vfetch_mini - int.
   spv::Id var_main_vfetch_address_;
+  // VR fork (VrBillboardShader): the card's centre (float3, the first vfetch_full of 3 floats at offset 0).
+  VrBillboard vr_billboard_ = VrBillboard::kNone;
+  bool vr_billboard_centre_stored_ = false;
+  spv::Id var_main_vr_billboard_centre_ = spv::NoResult;
+  spv::Id VrBillboardAxis(uint32_t constant);
   // float.
   spv::Id var_main_tfetch_lod_;
   // float3.

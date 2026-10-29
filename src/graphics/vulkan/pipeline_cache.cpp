@@ -48,6 +48,7 @@
 #include <rex/math.h>
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
+#include <rex/ui/vulkan/vr_twins.h>
 
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
@@ -3436,7 +3437,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   if (use_dynamic_rendering) {
     pipeline_rendering_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     pipeline_rendering_create_info.pNext = nullptr;
-    pipeline_rendering_create_info.viewMask = 0;
+    pipeline_rendering_create_info.viewMask = ui::vulkan::vr::Multiview() ? 0b11 : 0;  // VR fork: both eyes
 
     uint32_t color_attachment_count = 0;
     const auto& key = description.render_pass_key;
@@ -3463,6 +3464,17 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   VkGraphicsPipelineCreateInfo pipeline_create_info;
   pipeline_create_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
   pipeline_create_info.pNext = use_dynamic_rendering ? &pipeline_rendering_create_info : nullptr;
+  // VR fork, development: MCLA_VR_VRS_TEST=N shades every game draw at NxN (the most variable rate shading could save).
+  VkPipelineFragmentShadingRateStateCreateInfoKHR vr_shading_rate{
+      VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
+  static const uint32_t vr_vrs_test = std::getenv("MCLA_VR_VRS_TEST") ? uint32_t(std::atoi(std::getenv("MCLA_VR_VRS_TEST"))) : 0;
+  if (vr_vrs_test > 1 && command_processor_.GetVulkanDevice()->extensions().ext_KHR_fragment_shading_rate) {
+    vr_shading_rate.fragmentSize = {vr_vrs_test, vr_vrs_test};
+    vr_shading_rate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    vr_shading_rate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+    vr_shading_rate.pNext = pipeline_create_info.pNext;
+    pipeline_create_info.pNext = &vr_shading_rate;
+  }
   pipeline_create_info.flags = 0;
   pipeline_create_info.stageCount = shader_stage_count;
   pipeline_create_info.pStages = shader_stages.data();

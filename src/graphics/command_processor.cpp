@@ -735,6 +735,12 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg && count > 1 && base_index + count <= RegisterFile::kRegisterCount) {
+    // VR fork: consecutive registers in one go (shader constants are written this way: the backend's bulk path
+    // copies them and marks the constant buffers once instead of a call per register).
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     const uintptr_t source = reader->read_ptr();
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();

@@ -9,12 +9,15 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <cstring>
+#include <algorithm>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <rex/ui/vulkan/vr_openxr.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
@@ -26,6 +29,15 @@
 #endif
 
 REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
+
+#if REX_PLATFORM_PS5
+// The statically linked driver's entry point. The driver is an ICD with no
+// loader in front of it, so the name is the ICD interface's, and every other
+// function comes from it. Weak: see VulkanInstance::Create.
+extern "C" VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vk_icdGetInstanceProcAddr(VkInstance instance,
+                                                                              const char* name)
+    __attribute__((weak));
+#endif
 
 namespace rex {
 namespace ui {
@@ -74,6 +86,21 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     }
     return nullptr;
   }
+#elif REX_PLATFORM_PS5
+  // No loader library and no way to open one: the driver is linked into the
+  // executable (an installed title cannot load a graphics module at run
+  // time). Its entry points are weak references, so a build without the
+  // driver, such as a payload, still links and simply has no Vulkan.
+  loader_loaded = &::vk_icdGetInstanceProcAddr != nullptr;
+  if (!loader_loaded) {
+    REXLOG_ERROR("No Vulkan driver is linked into this executable");
+    return nullptr;
+  }
+  ifn.vkGetInstanceProcAddr = &::vk_icdGetInstanceProcAddr;
+  // An ICD only hands this out for a real instance; it is fetched again once
+  // one exists.
+  ifn.vkDestroyInstance =
+      PFN_vkDestroyInstance(ifn.vkGetInstanceProcAddr(nullptr, "vkDestroyInstance"));
 #else
   loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
   if (!loader_loaded) {
@@ -82,11 +109,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   }
 #endif
 
+#if !REX_PLATFORM_PS5
 #define XE_VULKAN_LOAD_LOADER_FUNCTION(name) \
   functions_loaded &= (ifn.name = vulkan_instance->loader_.GetSymbol<PFN_##name>(#name)) != nullptr;
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkGetInstanceProcAddr);
   XE_VULKAN_LOAD_LOADER_FUNCTION(vkDestroyInstance);
 #undef XE_VULKAN_LOAD_LOADER_FUNCTION
+#endif
   if (!functions_loaded) {
     REXLOG_ERROR("Failed to get Vulkan loader function pointers");
     return nullptr;
@@ -140,6 +169,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
   if (with_surface) {
     // #1.
     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+#if REX_PLATFORM_PS5
+    // #3. The console has no window system; the driver presents to the
+    // display itself.
+    requested_extensions.emplace("VK_KHR_display", &vulkan_instance->extensions_.ext_KHR_display);
+#endif
 #ifdef VK_USE_PLATFORM_XCB_KHR
     // #6.
     requested_extensions.emplace("VK_KHR_xcb_surface",
@@ -208,6 +242,14 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     if (!*requested_extension_it->second) {
       enabled_extensions.emplace_back(requested_extension_it->first.c_str());
       *requested_extension_it->second = true;
+    }
+  }
+
+  // VR fork: the OpenXR runtime's instance extensions (MCLA_VR=1).
+  for (const char* name : vr::InstanceExtensions()) {
+    if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                     [name](const char* e) { return std::strcmp(e, name) == 0; })) {
+      enabled_extensions.push_back(name);
     }
   }
 
@@ -383,6 +425,13 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                  vk::to_string(vk::Result(instance_create_result)));
     return nullptr;
   }
+
+#if REX_PLATFORM_PS5
+  if (!ifn.vkDestroyInstance) {
+    ifn.vkDestroyInstance = PFN_vkDestroyInstance(
+        ifn.vkGetInstanceProcAddr(vulkan_instance->instance_, "vkDestroyInstance"));
+  }
+#endif
 
   // Load instance functions.
 

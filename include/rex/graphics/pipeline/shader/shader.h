@@ -630,6 +630,15 @@ void ParseTextureFetchInstruction(const ucode::TextureFetchInstruction& op,
 void ParseAluInstruction(const ucode::AluInstruction& op, xenos::ShaderType shader_type,
                          ParsedAluInstruction& instr);
 
+// VR fork: vertex shaders of camera-facing cards. In VR the camera carries the head's turn, so every card turned with
+// the head; the SPIR-V translator faces each card to the camera's position (c15) from its own anchor (the first
+// vfetch_full of 3 floats) instead. MCLA_VR_BILLBOARD=0: as the game draws them.
+enum class VrBillboard {
+  kNone,
+  kHorizontalAxes,  // MCLA's bushes: spread along c208 (the camera's right) and c209 (its up), both made level
+};
+VrBillboard VrBillboardShader(xenos::ShaderType type, uint64_t ucode_data_hash);
+
 class Shader {
  public:
   // Type of the vertex shader on the host - shader interface depends on in, so

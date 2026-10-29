@@ -9,10 +9,15 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
+#include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <utility>
 
+#include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/assert.h>
 #include <rex/bit.h>
 #include <rex/dbg.h>
@@ -20,7 +25,81 @@
 #include <rex/math.h>
 #include <rex/memory.h>
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long long __stdcall GetTickCount64();
+#endif
+
+namespace {
+// VR fork: the hot pages' clock, read for every range requested (several a draw). Its 16 ms steps are enough for
+// heat that decays over a second; QueryPerformanceCounter there cost ~2% of the GPU thread.
+uint32_t HotPageClockMs() {
+#ifdef _WIN32
+  return uint32_t(GetTickCount64());
+#else
+  return uint32_t(rex::chrono::Clock::QueryHostUptimeMillis());
+#endif
+}
+}  // namespace
+
+REXCVAR_DEFINE_UINT32(shared_memory_request_granularity_log2, 0, "GPU",
+                      "log2 of the chunk to which requests for guest memory are widened before "
+                      "uploading and watching it; 0 (or anything not above the page size) "
+                      "requests exactly what a draw needs. Larger chunks mean fewer protection "
+                      "changes and more data uploaded per change");
+
+REXCVAR_DEFINE_UINT32(shared_memory_invalidation_pages_log2, 6, "GPU",
+                      "A guest write to watched memory invalidates up to 2^n pages around it "
+                      "(6 = the whole block of 64, the original behaviour)");
+REXCVAR_DEFINE_UINT32(shared_memory_hot_page_faults, 0, "GPU",
+                      "Guest write faults on one page, within about a second, after which the "
+                      "page is treated as hot: not watched, and uploaded whenever it is "
+                      "requested. 0 never does. For hosts where a fault and the protection "
+                      "changes around it are expensive");
+REXCVAR_DEFINE_UINT32(shared_memory_hot_page_exact, 1, "GPU",
+                      "1: of a hot page, upload only the bytes a draw asks for (where the "
+                      "graphics backend can); 0: the whole page");
+REXCVAR_DEFINE_UINT32(shared_memory_hot_page_ms, 2000, "GPU",
+                      "How long a hot page stays hot before it is watched again");
+REXCVAR_DEFINE_BOOL(shared_memory_hot_page_compare, true, "GPU",
+                    "Of hot pages uploaded whole (shared_memory_hot_page_exact 0), upload only the ones that changed "
+                    "since their last upload (a copy of each is kept to compare)");
+
 namespace rex::graphics {
+
+// Guest memory copied to the GPU buffer so far, for performance diagnosis.
+std::atomic<uint64_t> g_shared_memory_uploaded_bytes{0};
+uint64_t SharedMemoryUploadedBytes() {
+  return g_shared_memory_uploaded_bytes.load(std::memory_order_relaxed);
+}
+// Of that, the part that is hot pages; the bytes the draws actually asked for
+// within those pages; and the number of requests.
+std::atomic<uint64_t> g_shared_memory_hot_uploaded_bytes{0};
+std::atomic<uint64_t> g_shared_memory_hot_asked_bytes{0};
+std::atomic<uint64_t> g_shared_memory_requests{0};
+// Why tracked (not hot) pages were uploaded, in bytes, by PageState; bytes
+// invalidated by a write fault and by an explicit call; pages turned hot.
+enum PageState : uint8_t {
+  kPageNeverUploaded,
+  kPageInvalidatedByFault,
+  kPageInvalidatedExplicitly,
+  kPageUploaded,
+  kPageStateCount,
+};
+std::atomic<uint64_t> g_shared_memory_uploaded_by_state[kPageStateCount];
+std::atomic<uint64_t> g_shared_memory_fault_invalidated_bytes{0};
+std::atomic<uint64_t> g_shared_memory_explicitly_invalidated_bytes{0};
+std::atomic<uint64_t> g_shared_memory_pages_turned_hot{0};
+void SharedMemoryCounters(uint64_t out[10]) {
+  out[0] = g_shared_memory_hot_uploaded_bytes.load(std::memory_order_relaxed);
+  out[1] = g_shared_memory_hot_asked_bytes.load(std::memory_order_relaxed);
+  out[2] = g_shared_memory_requests.load(std::memory_order_relaxed);
+  for (int i = 0; i < kPageStateCount; ++i) {
+    out[3 + i] = g_shared_memory_uploaded_by_state[i].load(std::memory_order_relaxed);
+  }
+  out[7] = g_shared_memory_fault_invalidated_bytes.load(std::memory_order_relaxed);
+  out[8] = g_shared_memory_explicitly_invalidated_bytes.load(std::memory_order_relaxed);
+  out[9] = g_shared_memory_pages_turned_hot.load(std::memory_order_relaxed);
+}
 
 SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
   page_size_log2_ = rex::log2_ceil(uint32_t(rex::memory::page_size()));
@@ -34,6 +113,9 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  page_heat_.assign(size_t(num_system_page_flags_) * 64, 0);
+  page_state_.assign(size_t(num_system_page_flags_) * 64, kPageNeverUploaded);
+  page_hot_until_ms_.assign(size_t(num_system_page_flags_) * 64, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -254,9 +336,63 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
   }
 }
 
+void SharedMemory::VrMarkEyeDependent(uint32_t start, uint32_t length, bool eye_dependent) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  if (vr_eye_dependent_pages_.empty()) {
+    if (!eye_dependent) {
+      return;
+    }
+    vr_eye_dependent_pages_.assign(((kBufferSize >> page_size_log2_) + 63) / 64, 0);
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t first = start >> page_size_log2_, last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = first; page <= last; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    vr_eye_dependent_pages_[page >> 6] = eye_dependent ? (vr_eye_dependent_pages_[page >> 6] | bit)
+                                                       : (vr_eye_dependent_pages_[page >> 6] & ~bit);
+  }
+}
+
+bool SharedMemory::VrIsRangeEyeDependent(uint32_t start, uint32_t length) const {
+  if (vr_eye_dependent_pages_.empty() || !length || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t first = start >> page_size_log2_, last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = first; page <= last; ++page) {
+    if (vr_eye_dependent_pages_[page >> 6] & (uint64_t(1) << (page & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) const {
+  if (!length || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t first = start >> page_size_log2_, last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = first; page <= last; ++page) {
+    if (system_page_flags_valid_and_gpu_written_[page >> 6] & (uint64_t(1) << (page & 63))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   if (length == 0 || start >= kBufferSize) {
     return;
+  }
+  TrackSubmission();  // VR fork: written by the submission
+  TrackPages(vr_touched_pages_, start, length);
+  if (!hot_page_copies_.empty()) {  // VR fork: the GPU's data, not the guest's: no hot page copy holds it
+    for (uint32_t page = start >> page_size_log2_; page <= (start + length - 1) >> page_size_log2_; ++page) {
+      hot_page_copies_.erase(page);
+    }
   }
   length = std::min(length, kBufferSize - start);
   uint32_t end = start + length - 1;
@@ -291,8 +427,14 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
+  // Data uploaded from guest memory to a hot page is good for this request
+  // only: the page is not marked valid and not watched (data the GPU wrote is
+  // different, it exists nowhere else, so it is tracked as usual).
+  const uint32_t now_ms = HotPageClockMs();
+  bool skipped_hot_pages = false;
   {
     auto global_lock = global_critical_region_.Acquire();
+    const bool check_hot = !written_by_gpu && AnyPageHot(now_ms);
 
     for (uint32_t i = valid_block_first; i <= valid_block_last; ++i) {
       uint64_t valid_bits = UINT64_MAX;
@@ -302,17 +444,54 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
+      if (check_hot) {
+        const uint64_t hot_bits = HotPageMask(i, now_ms) & valid_bits;
+        if (hot_bits) {
+          skipped_hot_pages = true;
+          valid_bits &= ~hot_bits;
+        }
+      }
       system_page_flags_valid_[i] |= valid_bits;
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
+      if (!written_by_gpu && !vr_eye_dependent_pages_.empty()) {  // VR fork: CPU data, the same in both eyes
+        vr_eye_dependent_pages_[i] &= ~valid_bits;
+      }
     }
   }
 
   if (memory_invalidation_callback_handle_) {
-    memory().EnablePhysicalMemoryAccessCallbacks(
-        valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    if (!skipped_hot_pages) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    } else {
+      // Watch the runs of pages between the hot ones.
+      uint32_t run_first = UINT32_MAX;
+      for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+        const bool watch = page <= valid_page_last && !IsPageHot(page, now_ms);
+        if (watch) {
+          if (run_first == UINT32_MAX) run_first = page;
+        } else if (run_first != UINT32_MAX) {
+          memory().EnablePhysicalMemoryAccessCallbacks(run_first << page_size_log2_,
+                                                       (page - run_first) << page_size_log2_, true,
+                                                       false);
+          run_first = UINT32_MAX;
+        }
+      }
+    }
   }
+}
+
+uint64_t SharedMemory::HotPageMask(uint32_t block, uint32_t now_ms) const {
+  uint64_t mask = 0;
+  const uint32_t* until = &page_hot_until_ms_[size_t(block) * 64];
+  for (uint32_t n = 0; n < 64; ++n) {
+    if (int32_t(until[n] - now_ms) > 0) {
+      mask |= uint64_t(1) << n;
+    }
+  }
+  return mask;
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
@@ -338,13 +517,80 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
 }
 
 bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+  const bool result = RequestRangesUntracked(ranges, count);
+  if (ranges) {  // VR fork: read by the submission (after its uploads)
+    TrackSubmission();
+    for (size_t i = 0; i < count; ++i) {
+      TrackPages(vr_touched_pages_, ranges[i].first, ranges[i].second);
+    }
+  }
+  return result;
+}
+
+void SharedMemory::TrackSubmission() {
+  const uint64_t submission = TrackingSubmission();
+  if (vr_touched_pages_.empty()) {
+    const size_t words = ((kBufferSize >> page_size_log2_) + 63) / 64;
+    vr_touched_pages_.assign(words, 0);
+    vr_hoisted_pages_.assign(words, 0);
+    vr_tracked_submission_ = submission;
+  } else if (submission != vr_tracked_submission_) {
+    std::fill(vr_touched_pages_.begin(), vr_touched_pages_.end(), 0);
+    std::fill(vr_hoisted_pages_.begin(), vr_hoisted_pages_.end(), 0);
+    vr_tracked_submission_ = submission;
+  }
+}
+
+void SharedMemory::TrackPages(std::vector<uint64_t>& bitmap, uint32_t start, uint32_t length) {
+  if (!length || start >= kBufferSize) {
+    return;
+  }
+  length = std::min(length, kBufferSize - start);
+  const uint32_t first = start >> page_size_log2_, last = (start + length - 1) >> page_size_log2_;
+  for (uint32_t page = first; page <= last; ++page) {
+    bitmap[page >> 6] |= uint64_t(1) << (page & 63);
+  }
+}
+
+bool SharedMemory::HoistUpload(uint32_t page_first, uint32_t page_count) {
+  TrackSubmission();
+  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
+    const uint64_t bit = uint64_t(1) << (page & 63);
+    if ((vr_touched_pages_[page >> 6] | vr_hoisted_pages_[page >> 6]) & bit) {
+      return false;
+    }
+  }
+  for (uint32_t page = page_first; page < page_first + page_count; ++page) {
+    vr_hoisted_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+  }
+  return true;
+}
+
+bool SharedMemory::RequestRangesUntracked(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
   if (ranges == nullptr || !count) {
     return true;
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_merged_ranges_;
+  merged_ranges.clear();
+  // A write to watched memory invalidates a wide area at once (the block of 64
+  // pages around it, see MemoryInvalidationCallback), but each request then
+  // uploads and re-watches only the pages it needs, so one fault is followed
+  // by a protection change for every draw that comes back for its piece.
+  // Where a protection change is expensive (26 us on PS5 whatever its size),
+  // widening the request to whole chunks makes the re-watch as coarse as the
+  // invalidation: the invalid pages of the chunk are uploaded and watched in
+  // one go, and pages already valid are left alone as before.
+  // The ranges as asked for, before widening: hot pages are uploaded only
+  // where a draw really uses them.
+  std::vector<std::pair<uint32_t, uint32_t>>& requested_ranges = request_asked_ranges_;
+  requested_ranges.clear();
+  const uint32_t request_granularity_log2 =
+      std::min(uint32_t(REXCVAR_GET(shared_memory_request_granularity_log2)), uint32_t(24));
+  const uint32_t request_chunk_mask =
+      request_granularity_log2 > page_size_log2_ ? (uint32_t(1) << request_granularity_log2) - 1
+                                                 : 0;
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -354,6 +600,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     if (start > kBufferSize || (kBufferSize - start) < length) {
       return false;
     }
+    requested_ranges.emplace_back(start, length);
+    if (request_chunk_mask) {
+      const uint64_t end = std::min(
+          (uint64_t(start) + length + request_chunk_mask) & ~uint64_t(request_chunk_mask),
+          uint64_t(kBufferSize));
+      start &= ~request_chunk_mask;
+      length = uint32_t(end - start);
+    }
     merged_ranges.emplace_back(start, length);
   }
   if (merged_ranges.empty()) {
@@ -361,6 +615,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   SCOPE_profile_cpu_f("gpu");
+  g_shared_memory_requests.fetch_add(1, std::memory_order_relaxed);
 
   std::sort(merged_ranges.begin(), merged_ranges.end(),
             [](const std::pair<uint32_t, uint32_t>& a, const std::pair<uint32_t, uint32_t>& b) {
@@ -390,9 +645,19 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   upload_ranges_.clear();
+  hot_byte_ranges_.clear();
+  const bool hot_exact = REXCVAR_GET(shared_memory_hot_page_exact) != 0;
   auto append_upload_range = [this](uint32_t page_start, uint32_t page_count) {
     if (!page_count) {
       return;
+    }
+    for (uint32_t page = page_start; page < page_start + page_count; ++page) {
+      g_shared_memory_uploaded_by_state[page_state_[page]].fetch_add(
+          uint64_t(1) << page_size_log2_, std::memory_order_relaxed);
+      page_state_[page] = kPageUploaded;
+      if (!hot_page_copies_.empty()) {
+        hot_page_copies_.erase(page);  // VR fork: uploaded from a watch, not as hot
+      }
     }
     if (!upload_ranges_.empty()) {
       std::pair<uint32_t, uint32_t>& last_upload_range = upload_ranges_.back();
@@ -405,6 +670,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   };
   {
     auto global_lock = global_critical_region_.Acquire();
+    const uint32_t now_ms = HotPageClockMs();
+    const bool any_hot = AnyPageHot(now_ms);
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;
       uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
@@ -413,6 +680,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
       uint32_t range_start = UINT32_MAX;
       for (uint32_t i = block_first; i <= block_last; ++i) {
         uint64_t block_valid = system_page_flags_valid_[i];
+        // Hot pages are handled below, from the ranges as asked for.
+        if (any_hot) {
+          block_valid |= HotPageMask(i, now_ms);
+        }
         // Consider pages in the block outside the requested range valid.
         if (i == block_first) {
           uint64_t block_before = (uint64_t(1) << (page_first & 63)) - 1;
@@ -453,6 +724,100 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
         append_upload_range(range_start, page_last + 1 - range_start);
       }
     }
+    // Hot pages: always uploaded where a draw uses them (never where the
+    // request was only widened over them), unless the GPU wrote them, in which
+    // case guest memory does not have the data. Anything watching such a page
+    // (a texture loaded from it) is told it may have changed, since no fault
+    // will say so.
+    if (any_hot) {
+      for (const std::pair<uint32_t, uint32_t>& range : requested_ranges) {
+        const uint32_t page_first = range.first >> page_size_log2_;
+        const uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+        uint32_t run_first = UINT32_MAX;
+        for (uint32_t page = page_first; page <= page_last + 1; ++page) {
+          const bool upload =
+              page <= page_last && IsPageHot(page, now_ms) &&
+              !(system_page_flags_valid_and_gpu_written_[page >> 6] & (uint64_t(1) << (page & 63)));
+          if (upload) {
+            if (run_first == UINT32_MAX) run_first = page;
+          } else if (run_first != UINT32_MAX) {
+            const uint64_t run_start = uint64_t(run_first) << page_size_log2_;
+            const uint64_t run_end = uint64_t(page) << page_size_log2_;
+            const uint64_t asked_start = std::max(run_start, uint64_t(range.first));
+            const uint64_t asked_end = std::min(run_end, uint64_t(range.first) + range.second);
+            g_shared_memory_hot_asked_bytes.fetch_add(asked_end - asked_start,
+                                                      std::memory_order_relaxed);
+            if (hot_exact) {
+              // Only what is used, to 64-byte boundaries (a page is a multiple).
+              const uint32_t byte_start = uint32_t(asked_start) & ~uint32_t(63);
+              const uint32_t byte_end = uint32_t((asked_end + 63) & ~uint64_t(63));
+              hot_byte_ranges_.emplace_back(byte_start, byte_end - byte_start);
+            } else if (REXCVAR_GET(shared_memory_hot_page_compare)) {
+              // VR fork: only the pages that changed since their last upload.
+              const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+              uint32_t changed_first = UINT32_MAX;
+              for (uint32_t p = run_first; p <= page; ++p) {
+                bool changed = false;
+                if (p < page) {
+                  const uint8_t* guest = memory().TranslatePhysical(p << page_size_log2_);
+                  auto& copy = hot_page_copies_[p];
+                  // Only the bytes this draw asked for (a changed page is uploaded and kept whole, so the copy
+                  // stays what the GPU has).
+                  const uint32_t page_start = p << page_size_log2_;
+                  const uint32_t asked_first = std::max(page_start, range.first) - page_start;
+                  const uint32_t asked_end = std::min(page_start + page_bytes, range.first + range.second) - page_start;
+                  changed = !copy || std::memcmp(copy.get() + asked_first, guest + asked_first,
+                                                 asked_end - asked_first) != 0;
+                  static const bool vr_count = std::getenv("MCLA_VR_COUNT") != nullptr;  // development
+                  if (vr_count) {
+                    static uint64_t pages = 0, changed_pages = 0, blocks = 0, new_pages = 0;
+                    static auto window = std::chrono::steady_clock::now();
+                    ++pages;
+                    if (changed && copy) {
+                      ++changed_pages;
+                      for (uint32_t b = 0; b < page_bytes; b += 64) {
+                        blocks += std::memcmp(copy.get() + b, guest + b, 64) != 0;
+                      }
+                    } else if (changed) {
+                      ++new_pages;
+                    }
+                    if (std::chrono::steady_clock::now() - window > std::chrono::seconds(2)) {
+                      REXGPU_INFO("hot pages compared: {}, changed {} (+{} new), 64-byte blocks changed {:.1f} a page",
+                                  pages, changed_pages, new_pages, changed_pages ? double(blocks) / changed_pages : 0.0);
+                      pages = changed_pages = blocks = new_pages = 0;
+                      window = std::chrono::steady_clock::now();
+                    }
+                  }
+                  if (changed) {
+                    if (!copy) {
+                      copy = std::make_unique<uint8_t[]>(page_bytes);
+                    }
+                    std::memcpy(copy.get(), guest, page_bytes);
+                  }
+                }
+                if (changed && changed_first == UINT32_MAX) {
+                  changed_first = p;
+                } else if (!changed && changed_first != UINT32_MAX) {
+                  upload_ranges_.emplace_back(changed_first, p - changed_first);
+                  g_shared_memory_hot_uploaded_bytes.fetch_add(uint64_t(p - changed_first) << page_size_log2_,
+                                                               std::memory_order_relaxed);
+                  FireWatches(changed_first, p - 1, false);
+                  changed_first = UINT32_MAX;
+                }
+              }
+            } else {
+              upload_ranges_.emplace_back(run_first, page - run_first);
+              g_shared_memory_hot_uploaded_bytes.fetch_add(run_end - run_start,
+                                                           std::memory_order_relaxed);
+            }
+            if (hot_exact || !REXCVAR_GET(shared_memory_hot_page_compare)) {
+              FireWatches(run_first, page - 1, false);
+            }
+            run_first = UINT32_MAX;
+          }
+        }
+      }
+    }
   }
 
   COUNT_profile_set("gpu/shared_memory/request_ranges_count", uint32_t(count));
@@ -461,11 +826,42 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count",
                     uint32_t(upload_ranges_.size()));
 
-  if (upload_ranges_.empty()) {
+  if (upload_ranges_.empty() && hot_byte_ranges_.empty()) {
     return true;
   }
 
-  return UploadRanges(upload_ranges_);
+  uint64_t upload_pages = 0;
+  for (const std::pair<uint32_t, uint32_t>& upload_range : upload_ranges_) {
+    upload_pages += upload_range.second;
+  }
+  g_shared_memory_uploaded_bytes.fetch_add(upload_pages << page_size_log2_,
+                                           std::memory_order_relaxed);
+
+  std::sort(upload_ranges_.begin(), upload_ranges_.end());  // VR fork: hot pages come after the rest
+  if (!UploadRanges(upload_ranges_)) {
+    return false;
+  }
+  if (!hot_byte_ranges_.empty()) {
+    uint64_t hot_bytes = 0;
+    for (const std::pair<uint32_t, uint32_t>& byte_range : hot_byte_ranges_) {
+      hot_bytes += byte_range.second;
+    }
+    if (UploadByteRanges(hot_byte_ranges_)) {
+      g_shared_memory_uploaded_bytes.fetch_add(hot_bytes, std::memory_order_relaxed);
+      g_shared_memory_hot_uploaded_bytes.fetch_add(hot_bytes, std::memory_order_relaxed);
+    } else {
+      // No byte path in this backend: the whole pages, as before.
+      upload_ranges_.clear();
+      for (const std::pair<uint32_t, uint32_t>& byte_range : hot_byte_ranges_) {
+        const uint32_t page_first = byte_range.first >> page_size_log2_;
+        const uint32_t page_last = (byte_range.first + byte_range.second - 1) >> page_size_log2_;
+        upload_ranges_.emplace_back(page_first, page_last - page_first + 1);
+      }
+      std::sort(upload_ranges_.begin(), upload_ranges_.end());
+      return UploadRanges(upload_ranges_);
+    }
+  }
+  return true;
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
@@ -493,6 +889,55 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_last = page_last >> 6;
 
   auto global_lock = global_critical_region_.Acquire();
+  {  // VR fork, development (MCLA_VR_COUNT): invalidations by kind, every 2 s
+    static const bool vr_count = std::getenv("MCLA_VR_COUNT") != nullptr;
+    if (vr_count) {
+      static uint64_t exact_calls = 0, exact_pages = 0, fault_calls = 0, fault_pages = 0;
+      static auto window = std::chrono::steady_clock::now();
+      (exact_range ? exact_calls : fault_calls) += 1;
+      (exact_range ? exact_pages : fault_pages) += page_last - page_first + 1;
+      if (std::chrono::steady_clock::now() - window > std::chrono::seconds(2)) {
+        REXGPU_INFO("invalidations in 2 s: {} exact ({} pages), {} write faults ({} pages)", exact_calls, exact_pages,
+                    fault_calls, fault_pages);
+        exact_calls = exact_pages = fault_calls = fault_pages = 0;
+        window = std::chrono::steady_clock::now();
+      }
+    }
+  }
+
+  // A guest write fault (not an exact-range invalidation, which is the GPU
+  // side or an explicit request): count it against the pages written, and
+  // make a page that keeps faulting hot.
+  const uint32_t hot_threshold = REXCVAR_GET(shared_memory_hot_page_faults);
+  if (!exact_range && hot_threshold) {
+    const uint32_t now_ms = HotPageClockMs();
+    if (uint32_t(now_ms - page_heat_decay_ms_) >= 1000) {
+      page_heat_decay_ms_ = now_ms;
+      for (uint8_t& heat : page_heat_) {
+        heat >>= 1;
+      }
+    }
+    const uint32_t hot_until = now_ms + std::max(REXCVAR_GET(shared_memory_hot_page_ms), uint32_t(1));
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      if (page_heat_[page] < 255) {
+        ++page_heat_[page];
+      }
+      if (page_heat_[page] >= hot_threshold) {
+        g_shared_memory_pages_turned_hot.fetch_add(1, std::memory_order_relaxed);
+        page_heat_[page] = 0;
+        page_hot_until_ms_[page] = hot_until;
+        page_hot_latest_until_ms_ = hot_until;
+      }
+    }
+  }
+
+  // How far a write fault's invalidation may be widened: to the block of 64
+  // pages by default, which is 256 KiB with 4 KiB pages but 1 MiB with 16 KiB
+  // ones, all of it to be copied again.
+  const uint32_t widen_mask =
+      (uint32_t(1) << std::min(REXCVAR_GET(shared_memory_invalidation_pages_log2), uint32_t(6))) - 1;
+  const uint32_t widen_first = page_first & ~widen_mask;
+  const uint32_t widen_last = page_last | widen_mask;
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be
@@ -514,6 +959,8 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
       page_last =
           (page_last & ~uint32_t(63)) + (std::max(rex::tzcnt(gpu_written_end), uint8_t(1)) - 1);
     }
+    page_first = std::max(page_first, widen_first);
+    page_last = std::min(page_last, widen_last);
   }
 
   for (uint32_t i = block_first; i <= block_last; ++i) {
@@ -527,6 +974,14 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
+
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    page_state_[page] = exact_range ? kPageInvalidatedExplicitly : kPageInvalidatedByFault;
+  }
+  (exact_range ? g_shared_memory_explicitly_invalidated_bytes
+               : g_shared_memory_fault_invalidated_bytes)
+      .fetch_add(uint64_t(page_last - page_first + 1) << page_size_log2_,
+                 std::memory_order_relaxed);
 
   FireWatches(page_first, page_last, false);
 

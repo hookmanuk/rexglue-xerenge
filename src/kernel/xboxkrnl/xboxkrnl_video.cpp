@@ -33,6 +33,11 @@
 #include <rex/system/xtypes.h>
 #include <rex/ui/flags.h>
 
+// VR fork (rexui, vr_openxr.h: its Vulkan headers are not on this target's path).
+namespace rex::ui::vulkan::vr {
+void OnGameSwap(uint32_t frontbuffer_physical_address);
+}
+
 namespace {
 // Display gamma type: 0 - linear, 1 - sRGB (CRT), 2 - BT.709 (HDTV), 3 - power
 constexpr uint32_t kDisplayGammaType = 2;
@@ -525,6 +530,8 @@ void VdSwap_entry(mapped_void buffer_ptr,      // ptr into primary ringbuffer
     return;
   }
   gpu_fetch.base_address = frontbuffer_physical_address >> 12;
+  // VR fork: the frame's head pose goes with its swap packet (matched on the GPU thread by this frontbuffer).
+  rex::ui::vulkan::vr::OnGameSwap(frontbuffer_physical_address);
 
   auto texture_format = rex::graphics::xenos::TextureFormat(texture_format_ptr.value());
   auto color_space = *color_space_ptr;

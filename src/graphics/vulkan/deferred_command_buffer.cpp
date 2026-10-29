@@ -13,6 +13,9 @@
 #include <cstdint>
 #include <cstring>
 
+#include <rex/ui/vulkan/vr_openxr.h>
+#include <rex/ui/vulkan/vr_dlss.h>
+#include <rex/ui/vulkan/vr_twins.h>
 #include <rex/assert.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
@@ -30,17 +33,141 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
 
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+  prologue_stream_.clear();
+  prologue_ = false;
 }
 
-void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+void DeferredCommandBuffer::BeginPrologue() {
+  const bool first = prologue_stream_.empty();
+  prologue_ = true;
+  if (first) {  // after everything before the submission (its reads and writes), before the copies
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    CmdVkPipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0,
+                         nullptr, 0, nullptr);
+  }
+}
+
+void DeferredCommandBuffer::FinishPrologue() {
+  prologue_ = false;
+  if (prologue_stream_.empty()) {
+    return;
+  }
+  {  // the copies before everything after them
+    prologue_ = true;
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    CmdVkPipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                         nullptr, 0, nullptr);
+    prologue_ = false;
+  }
+  prologue_stream_.insert(prologue_stream_.end(), command_stream_.begin(), command_stream_.end());
+  command_stream_.swap(prologue_stream_);
+  prologue_stream_.clear();
+}
+
+void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer,
+                                    const std::vector<uintmax_t>& command_stream) const {
+  if (ui::vulkan::vr::Multiview()) {
+    ExecuteMultiview(command_buffer, command_stream);
+    return;
+  }
+  ExecuteWith(command_buffer, command_stream, command_processor_.GetVulkanDevice()->functions());
+  if (ui::vulkan::vr::Stereo()) {  // VR fork: the right eye replays the commands on its twins
+    ui::vulkan::vr::BeginRightEye(command_buffer);
+    ExecuteWith(command_buffer, command_stream, ui::vulkan::vr::RightEyeFunctions());
+    ui::vulkan::vr::EndRightEye();
+  }
+}
+
+// VR fork: multiview stereo. The stream in runs: the commands between passes, then a pass. A run between passes and
+// a pass the left eye's table does not begin as multiview (not into render targets) are replayed for the left eye,
+// then for the right on its twins; a pass into render targets draws both eyes at once. Compute state set inside such a
+// pass (a dispatch's pipeline, sets and constants bound before the barriers that end the pass) is the left eye's
+// there; the right eye's replay sets it again before its next run.
+void DeferredCommandBuffer::ExecuteMultiview(VkCommandBuffer command_buffer,
+                                             const std::vector<uintmax_t>& command_stream) const {
+  const ui::vulkan::VulkanDevice::Functions& left = ui::vulkan::vr::LeftEyeFunctions();
+  const ui::vulkan::VulkanDevice::Functions& right = ui::vulkan::vr::RightEyeFunctions();
+  ui::vulkan::vr::BeginReplay();
+  const uintmax_t* stream = command_stream.data();
+  const uintmax_t* const end = stream + command_stream.size();
+  const auto header_at = [](const uintmax_t* p) -> const CommandHeader& {
+    return *reinterpret_cast<const CommandHeader*>(p);
+  };
+  const auto next = [&](const uintmax_t* p) {
+    return p + kCommandHeaderSizeElements + header_at(p).arguments_size_elements;
+  };
+  const auto begins_pass = [&](const uintmax_t* p) {
+    return header_at(p).command == Command::kVkBeginRendering ||
+           header_at(p).command == Command::kVkBeginRenderPass;
+  };
+  const auto sets_compute_state = [&](const uintmax_t* p) {
+    const void* args = p + kCommandHeaderSizeElements;
+    switch (header_at(p).command) {
+      case Command::kVkBindPipeline:
+        return static_cast<const ArgsVkBindPipeline*>(args)->pipeline_bind_point == VK_PIPELINE_BIND_POINT_COMPUTE;
+      case Command::kVkBindDescriptorSets:
+        return static_cast<const ArgsVkBindDescriptorSets*>(args)->pipeline_bind_point ==
+               VK_PIPELINE_BIND_POINT_COMPUTE;
+      case Command::kVkPushConstants:
+        return (static_cast<const ArgsVkPushConstants*>(args)->stage_flags & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+      default:
+        return false;
+    }
+  };
+  thread_local std::vector<const uintmax_t*> carried;  // compute state set in passes drawing both eyes
+  carried.clear();
+  while (stream < end) {
+    const uintmax_t* run_end = stream;
+    const bool pass = begins_pass(stream);
+    if (pass) {
+      const Command end_command = header_at(stream).command == Command::kVkBeginRendering
+                                      ? Command::kVkEndRendering
+                                      : Command::kVkEndRenderPass;
+      while (run_end < end) {
+        const bool ends = header_at(run_end).command == end_command;
+        run_end = next(run_end);
+        if (ends) {
+          break;
+        }
+      }
+    } else {
+      while (run_end < end && !begins_pass(run_end)) {
+        run_end = next(run_end);
+      }
+    }
+    const size_t size = size_t(run_end - stream);
+    ExecuteRange(command_buffer, stream, size, left);
+    if (!pass || !ui::vulkan::vr::LastPassMultiview()) {
+      ui::vulkan::vr::SetReplayEye(1);
+      for (const uintmax_t* command : carried) {
+        ExecuteRange(command_buffer, command, size_t(next(command) - command), right);
+      }
+      carried.clear();
+      ExecuteRange(command_buffer, stream, size, right);
+      ui::vulkan::vr::SetReplayEye(0);
+    } else {
+      for (const uintmax_t* p = stream; p < run_end; p = next(p)) {
+        if (sets_compute_state(p)) {
+          carried.push_back(p);
+        }
+      }
+    }
+    stream = run_end;
+  }
+  ui::vulkan::vr::EndReplay();
+}
+
+void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer, const uintmax_t* stream,
+                                         size_t stream_remaining,
+                                         const ui::vulkan::VulkanDevice::Functions& dfn) const {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
-  const ui::vulkan::VulkanDevice::Functions& dfn =
-      command_processor_.GetVulkanDevice()->functions();
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -266,6 +393,38 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
       } break;
 
+      case Command::kVrFrameCopy: {
+        const auto& args = *reinterpret_cast<const ArgsVrFrameCopy*>(stream);
+        ui::vulkan::vr::RecordFrameCopy(command_buffer, args.image, args.layout, args.width, args.height,
+                                        args.screen, args.kind);
+      } break;
+
+      case Command::kVrEyeShift: {
+        const auto& args = *reinterpret_cast<const ArgsVrEyeShift*>(stream);
+        ui::vulkan::vr::RecordEyeShift(command_buffer, args.layout, args.perspective != 0, args.push, dfn);
+      } break;
+
+      case Command::kVrPushTextures: {
+        const auto& args = *reinterpret_cast<const ArgsVrPushTextures*>(stream);
+        ui::vulkan::vr::PushTextureDescriptors(
+            command_buffer, args.layout, args.set, args.texture_count, args.sampler_count,
+            reinterpret_cast<const VkDescriptorImageInfo*>(
+                reinterpret_cast<const uint8_t*>(stream) +
+                rex::align(sizeof(ArgsVrPushTextures), alignof(VkDescriptorImageInfo))));
+      } break;
+
+      case Command::kVrDlssDepth: {
+        const auto& args = *reinterpret_cast<const ArgsVrDlssDepth*>(stream);
+        ui::vulkan::vr::dlss::RecordDepthMotion(command_buffer, args.image, args.view, args.layout, args.width,
+                                                args.height, args.view_projection, args.jitter_x, args.jitter_y, args.frame);
+      } break;
+
+      case Command::kVrMark: {
+        if (vr_mark_hook) {  // both eyes: the categories sum them
+          vr_mark_hook(command_buffer, *reinterpret_cast<const uint32_t*>(stream));
+        }
+      } break;
+
       case Command::kVkResetQueryPool: {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
@@ -416,12 +575,13 @@ void DeferredCommandBuffer::CmdVkBeginRendering(const VkRenderingInfo* rendering
 void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
-  size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
-  CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+  std::vector<uintmax_t>& stream = prologue_ ? prologue_stream_ : command_stream_;  // VR fork: or the prologue
+  size_t offset = stream.size();
+  stream.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+  CommandHeader& header = *reinterpret_cast<CommandHeader*>(stream.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);
-  return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+  return stream.data() + (offset + kCommandHeaderSizeElements);
 }
 
 }  // namespace rex::graphics::vulkan

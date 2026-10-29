@@ -16,6 +16,7 @@
 #include <map>
 #include <unordered_map>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include <fmt/format.h>
@@ -170,6 +171,7 @@ class RenderTargetCache {
   virtual void ClearCache();
 
   virtual void BeginFrame();
+  void VrNextFrame() { ++vr_frame_; }  // VR fork: the frame count for idle render targets (Vulkan has no BeginFrame)
 
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
@@ -293,6 +295,7 @@ class RenderTargetCache {
     RenderTarget(RenderTarget&& render_target) = delete;
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
+    uint64_t vr_last_used_frame = 0;  // VR fork: the frame it was last drawn to (pruning idle targets)
 
    protected:
     RenderTarget(RenderTargetKey key) : key_(key) {}
@@ -300,6 +303,11 @@ class RenderTargetCache {
    private:
     RenderTargetKey key_;
   };
+
+  // VR fork: render targets owning no EDRAM range (their contents can never be read), not bound, and not drawn to
+  // for `idle_frames` frames: counted, or taken out of the cache (the caller deletes them once the GPU is done).
+  size_t VrCountIdleRenderTargets(uint64_t idle_frames) const;
+  void VrTakeIdleRenderTargets(uint64_t idle_frames, std::vector<RenderTarget*>& taken);
 
   struct Transfer {
     uint32_t start_tiles;
@@ -660,6 +668,10 @@ class RenderTargetCache {
   // since standard containers use dynamic allocation for elements, though
   // changes to this throughout a frame are pretty rare.
   std::map<uint32_t, OwnershipRange> ownership_ranges_;
+  uint64_t vr_frame_ = 0;  // VR fork: frames begun (render target idle time)
+  bool VrIsIdle(const RenderTarget* render_target, uint64_t idle_frames,
+                const std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher>& owners) const;
+  std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> VrOwners() const;
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

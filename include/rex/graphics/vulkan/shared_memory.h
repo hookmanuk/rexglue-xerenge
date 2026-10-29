@@ -53,7 +53,10 @@ class VulkanSharedMemory : public SharedMemory {
   bool AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                         uint32_t length_allocations) override;
 
+  uint64_t TrackingSubmission() const override;  // VR fork: the submission (upload hoisting)
   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+  bool UploadByteRanges(
+      const std::vector<std::pair<uint32_t, uint32_t>>& upload_byte_ranges) override;
 
  private:
   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,

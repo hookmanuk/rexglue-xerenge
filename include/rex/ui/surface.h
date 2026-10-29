@@ -36,6 +36,8 @@ class Surface {
     kTypeIndex_Win32Hwnd,
     // macOS — CAMetalLayer presented via MoltenVK (VK_EXT_metal_surface).
     kTypeIndex_CAMetalLayer,
+    // PlayStation 5 homebrew — the console's display, through VK_KHR_display.
+    kTypeIndex_Ps5Display,
   };
   using TypeFlags = uint32_t;
   enum : TypeFlags {
@@ -44,6 +46,7 @@ class Surface {
     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
     kTypeFlag_CAMetalLayer = TypeFlags(1) << kTypeIndex_CAMetalLayer,
+    kTypeFlag_Ps5Display = TypeFlags(1) << kTypeIndex_Ps5Display,
   };
 
   Surface(const Surface& surface) = delete;

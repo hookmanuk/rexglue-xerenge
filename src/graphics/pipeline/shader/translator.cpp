@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdarg>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -45,6 +46,23 @@ using namespace ucode;
 //
 // Lots of naming comes from the disassembly spit out by the XNA GS compiler
 // and dumps of d3dcompiler and games: https://pastebin.com/i4kAv7bB
+
+VrBillboard VrBillboardShader(xenos::ShaderType type, uint64_t ucode_data_hash) {
+  static const bool enabled = [] {
+    const char* v = std::getenv("MCLA_VR_BILLBOARD");
+    return !(v && v[0] == '0');
+  }();
+  if (!enabled || type != xenos::ShaderType::kVertex) {
+    return VrBillboard::kNone;
+  }
+  switch (ucode_data_hash) {
+    case 0x4D181C0D99016B72ull:  // bushes
+    case 0xAD73CDF775982D19ull:  // bushes, depth
+      return VrBillboard::kHorizontalAxes;
+    default:
+      return VrBillboard::kNone;
+  }
+}
 
 void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   if (is_ucode_analyzed_) {
@@ -185,6 +203,9 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
   }
   ucode_disassembly_ = ucode_disasm_buffer.to_string();
 
+  if (VrBillboardShader(type(), ucode_data_hash()) != VrBillboard::kNone) {  // VR fork: the world, the camera (c15)
+    constant_register_map_.float_bitmap[0] |= UINT64_C(0b1000000000001111);
+  }
   if (constant_register_map_.float_dynamic_addressing) {
     // All potentially can be referenced.
     constant_register_map_.float_count = 256;

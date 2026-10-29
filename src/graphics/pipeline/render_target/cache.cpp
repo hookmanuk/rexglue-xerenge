@@ -393,6 +393,56 @@ void RenderTargetCache::ClearCache() {
   }
 }
 
+bool RenderTargetCache::VrIsIdle(const RenderTarget* render_target, uint64_t idle_frames,
+                                 const std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher>& owners) const {
+  if (!render_target || owners.count(render_target->key()) || vr_frame_ - render_target->vr_last_used_frame < idle_frames) {
+    return false;
+  }
+  for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+    if (last_update_used_render_targets_[i] == render_target ||
+        last_update_accumulated_render_targets_[i] == render_target) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::unordered_set<RenderTargetCache::RenderTargetKey, RenderTargetCache::RenderTargetKey::Hasher>
+RenderTargetCache::VrOwners() const {
+  std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> owners;
+  for (const auto& [start, range] : ownership_ranges_) {
+    for (const RenderTargetKey& key :
+         {range.render_target, range.host_depth_render_target_unorm24, range.host_depth_render_target_float24}) {
+      if (!key.IsEmpty()) {
+        owners.insert(key);
+      }
+    }
+  }
+  return owners;
+}
+
+size_t RenderTargetCache::VrCountIdleRenderTargets(uint64_t idle_frames) const {
+  const auto owners = VrOwners();
+  size_t count = 0;
+  for (const auto& [key, render_target] : render_targets_) {
+    count += VrIsIdle(render_target, idle_frames, owners);
+  }
+  return count;
+}
+
+void RenderTargetCache::VrTakeIdleRenderTargets(uint64_t idle_frames, std::vector<RenderTarget*>& taken) {
+  taken.clear();
+  const auto owners = VrOwners();
+  for (auto it = render_targets_.begin(); it != render_targets_.end();) {
+    if (VrIsIdle(it->second, idle_frames, owners)) {
+      taken.push_back(it->second);
+      it = render_targets_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
@@ -699,6 +749,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     last_update_used_render_targets_[i] =
         (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
+    if (last_update_used_render_targets_[i]) {
+      last_update_used_render_targets_[i]->vr_last_used_frame = vr_frame_;  // VR fork
+    }
   }
   if (are_accumulated_render_targets_valid_) {
     // Check if the only re-enabling a previously bound render target.
