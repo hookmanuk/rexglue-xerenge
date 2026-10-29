@@ -5618,6 +5618,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       constants += fmt::format("{:.3g}{}", f, i % 4 == 3 ? " | " : " ");
     }
     REXGPU_INFO("vr frame draw constants: {}", constants);
+    {  // VR fork, development: the raw texture fetch constants 0-5 and RB_COLOR_INFO 0 (format, exp bias)
+      std::string fetches;
+      for (uint32_t t = 0; t < 6; ++t) {
+        fetches += fmt::format("tf{}:", t);
+        for (uint32_t w = 0; w < 6; ++w) {
+          fetches += fmt::format(" {:08X}", regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + t * 6 + w]);
+        }
+        fetches += " | ";
+      }
+      REXGPU_INFO("vr frame draw fetch: color0 {:08X} {}", color0.value, fetches);
+      if (pixel_shader) {  // the pixel shader's constants c48-c63 and c250-c255
+        std::string pc;
+        for (uint32_t c : {48u, 49u, 50u, 51u, 52u, 53u, 54u, 55u, 56u, 57u, 58u, 59u, 60u, 61u, 62u, 63u, 250u, 251u,
+                           252u, 253u, 254u, 255u}) {
+          float f[4];
+          std::memcpy(f, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + c * 4], 16);
+          pc += fmt::format("c{} {:.4g} {:.4g} {:.4g} {:.4g} | ", c, f[0], f[1], f[2], f[3]);
+        }
+        REXGPU_INFO("vr frame draw ps constants: {}", pc);
+      }
+    }
   }
 
   // Draw.
@@ -5979,6 +6000,8 @@ bool VulkanCommandProcessor::IssueCopy() {
                   uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base),
                   uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format),
                   written_address, written_length);
+      REXGPU_INFO("vr frame resolve copy: dest info {:08X} control {:08X}", regs[XE_GPU_REG_RB_COPY_DEST_INFO],
+                  regs[XE_GPU_REG_RB_COPY_CONTROL]);
     }
     return resolved;
   }
