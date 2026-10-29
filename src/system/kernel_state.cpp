@@ -64,6 +64,45 @@ KernelState::KernelState(Runtime* emulator)
   function_dispatcher_ = emulator->function_dispatcher();
   file_system_ = emulator->file_system();
 
+  // VR fork, development: XERENGE_THREAD_DUMP=<file>: when the file appears, every guest thread's id, name, link
+  // register and r3-r5 are logged (a thread blocked in a kernel call: lr is the guest code waiting) and the file removed.
+  if (const char* dump_file = std::getenv("XERENGE_THREAD_DUMP"); dump_file && *dump_file) {
+    std::thread([this, path = std::string(dump_file)] {
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+          continue;
+        }
+        std::filesystem::remove(path, ec);
+        for (const object_ref<XThread>& thread : object_table()->GetObjectsByType<XThread>()) {
+          if (!thread || !thread->is_guest_thread() || !thread->thread_state()) {
+            continue;
+          }
+          const PPCContext* c = thread->thread_state()->context();
+          REXSYS_INFO("thread dump: {:08X} '{}'{} lr {:08X} r3 {:08X} r4 {:08X} r5 {:08X} r31 {:08X}",
+                      thread->thread_id(), thread->name(), thread->main_thread() ? " (main)" : "",
+                      uint32_t(c->lr), c->r3.u32, c->r4.u32, c->r5.u32, c->r31.u32);
+          // The objects in r30 and r31 (a C++ object's first word is its vtable): their vtables' entries 160-176.
+          for (const uint32_t object : {c->r30.u32, c->r31.u32}) {
+            if (object < 0x10000 || object >= 0xF0000000u) {
+              continue;
+            }
+            const uint32_t vtable = memory_->TranslateVirtual<rex::be<uint32_t>*>(object)[0];
+            if (vtable < 0x82000000u || vtable >= 0x83000000u) {
+              continue;
+            }
+            const auto* entries = memory_->TranslateVirtual<rex::be<uint32_t>*>(vtable);
+            REXSYS_INFO("thread dump:   object {:08X} vtable {:08X}: +160 {:08X} +164 {:08X} +168 {:08X} +172 {:08X} "
+                        "+176 {:08X}",
+                        object, vtable, uint32_t(entries[40]), uint32_t(entries[41]), uint32_t(entries[42]),
+                        uint32_t(entries[43]), uint32_t(entries[44]));
+          }
+        }
+      }
+    }).detach();
+  }
+
   app_manager_ = std::make_unique<xam::AppManager>();
   user_profile_ = std::make_unique<xam::UserProfile>();
   user_profile_->set_kernel_state(this);

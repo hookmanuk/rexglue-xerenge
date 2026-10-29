@@ -3007,12 +3007,15 @@ int VulkanCommandProcessor::VrScaledEdges() const {
 }
 
 // VR fork, development: VR_LOG_FRAME=N (swaps counted from the start).
+// VR_LOG_FRAME_FILE=<path>: when the file appears, the next frame is logged and the file removed (IssueSwap).
+std::atomic<uint32_t> g_vr_log_frame_requested{0};
 bool VulkanCommandProcessor::VrLogThisFrame() const {
   static const uint32_t frame = [] {
     const char* v = std::getenv("VR_LOG_FRAME");
     return v ? uint32_t(std::atoi(v)) : 0u;
   }();
-  return frame && vr_log_swap_count_ == frame;
+  const uint32_t requested = g_vr_log_frame_requested.load(std::memory_order_relaxed);
+  return (frame && vr_log_swap_count_ == frame) || (requested && vr_log_swap_count_ == requested);
 }
 
 void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
@@ -3026,6 +3029,14 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
       std::filesystem::remove(trigger, ec);
       renderdoc->api_1_0_0()->TriggerCapture();
       REXGPU_INFO("RenderDoc capture triggered");
+    }
+  }
+  if (static const char* log_file = std::getenv("VR_LOG_FRAME_FILE"); log_file && *log_file) {  // VR fork, dev
+    std::error_code ec;
+    if (std::filesystem::exists(log_file, ec)) {
+      std::filesystem::remove(log_file, ec);
+      g_vr_log_frame_requested = vr_log_swap_count_ + 1;
+      REXGPU_INFO("vr frame log: swap {} requested", vr_log_swap_count_ + 1);
     }
   }
   if (VrLogThisFrame()) {  // VR fork, development
