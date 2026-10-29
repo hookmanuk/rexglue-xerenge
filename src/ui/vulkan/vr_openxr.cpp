@@ -1956,6 +1956,7 @@ bool TakeCameraPose(float (&pose)[16], float (&tangents)[4]) {
 
 void SetPresentPose(bool posed, const float (&pose)[16], const float (&tangents)[4]) {
   std::scoped_lock lock{g.pose_mutex};
+  g.swap_poses.clear();  // the xenos GPU thread's queue: unused here, and SplitFrame looks at its front
   g.gpu_pose.posed = posed;
   if (posed) {
     std::memcpy(g.gpu_pose.pose, pose, sizeof(g.gpu_pose.pose));
