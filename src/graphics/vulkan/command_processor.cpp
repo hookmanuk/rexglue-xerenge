@@ -5527,7 +5527,28 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       float world[16], world_view_projection[16];
       VrDrawMatrix(false, world);
       VrDrawMatrix(true, world_view_projection);
-      ui::vulkan::vr::dlss::NoteSceneDraw(world, world_view_projection);
+      // MCLA_VR_CAMERA_VS (rigid draws, vr_world_constant -1): the vertex shaders whose WVP is the camera's
+      // view-projection (the static world's, Burnout); the rest take their world from it (their own motion).
+      static const std::vector<uint64_t> vr_camera_vs = [] {
+        std::vector<uint64_t> list;
+        if (const char* v = std::getenv("MCLA_VR_CAMERA_VS")) {
+          for (const char* p = v; *p;) {
+            char* end;
+            const uint64_t hash = std::strtoull(p, &end, 16);
+            if (end == p) {
+              break;
+            }
+            list.push_back(hash);
+            p = *end == ',' ? end + 1 : end;
+          }
+        }
+        return list;
+      }();
+      const bool vr_camera_listed = !vr_camera_vs.empty();
+      if (!vr_camera_listed || std::find(vr_camera_vs.begin(), vr_camera_vs.end(),
+                                         vertex_shader->ucode_data_hash()) != vr_camera_vs.end()) {
+        ui::vulkan::vr::dlss::NoteSceneDraw(world, world_view_projection);
+      }
       if (!vr_frame_scene_ && VrHeadTrackedProjection(world, world_view_projection)) {
         vr_frame_scene_ = true;
         ui::vulkan::vr::SceneDrawStarted();  // VR fork: the pose this frame is drawn with
@@ -5556,7 +5577,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
       key = key * 31 + (index_buffer_info ? index_buffer_info->guest_base : 0);
       key = key * 31 + index_count;
-      if (ui::vulkan::vr::dlss::DrawMotion(key, world, world_view_projection, vr_push)) {
+      float vr_motion_world[16];
+      const bool vr_world_known = !vr_camera_listed || REXCVAR_GET(vr_world_constant) >= 0 ||
+                                  ui::vulkan::vr::dlss::WorldFromCamera(world_view_projection, vr_motion_world);
+      if (vr_world_known &&
+          ui::vulkan::vr::dlss::DrawMotion(key, vr_camera_listed && REXCVAR_GET(vr_world_constant) < 0 ? vr_motion_world
+                                                                                                    : world,
+                                           world_view_projection, vr_push)) {
         vr_push.motion = 1.f;
       }
     }
@@ -5962,15 +5989,33 @@ bool VulkanCommandProcessor::IssueCopy() {
       DeferredCommandBuffer::ArgsVrDlssDepth vr_depth{};
       uint32_t vr_depth_samples = 0;
       const void* vr_depth_target = nullptr;
-      if (copy_control.copy_src_select < 4 && vr_output_width_ &&
+      // MCLA_VR_DLSS_TILES=1 (Burnout): the scene is drawn in tiles (predicated tiling: the scissor holds the tile's
+      // rows, the window offset moves them into the render target) at 2x MSAA; each tile's rows of the depth are
+      // taken at its first colour resolve, sample 0.
+      static const bool vr_dlss_tiles = [] {
+        const char* v = std::getenv("MCLA_VR_DLSS_TILES");
+        return v && v[0] == '1';
+      }();
+      if (copy_control.copy_src_select < (vr_dlss_tiles ? 1u : 4u) && vr_output_width_ &&
           regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == vr_output_width_ &&
           (vr_depth_target = render_target_cache_->VrDepthTarget())) {
         // A single-sampled depth only (the game's occasional multisampled passes leave the frame's camera for a later
-        // resolve).
+        // resolve), but for tiles.
         VulkanRenderTargetCache::VrDepthImage(vr_depth_target, vr_depth.image, vr_depth.view, vr_depth.layout,
                                               vr_depth_samples);
-        if (vr_depth_samples == 1 && ui::vulkan::vr::dlss::TakeSceneCamera(vr_depth.view_projection, vr_depth.jitter_x,
-                                                                            vr_depth.jitter_y, vr_depth.frame)) {
+        const uint32_t scale_y = render_target_cache_->draw_resolution_scale_y();
+        const uint32_t tl_y = (regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] >> 16) & 0x7FFF;
+        const uint32_t br_y = std::min((regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] >> 16) & 0x7FFF, vr_output_height_);
+        const int32_t window_y = int32_t(regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET] << 1) >> 17;  // bits 16-30, signed
+        if ((vr_depth_samples == 1 || vr_dlss_tiles) && (!vr_dlss_tiles || br_y > tl_y) &&
+            ui::vulkan::vr::dlss::TakeSceneCamera(vr_depth.view_projection, vr_depth.jitter_x, vr_depth.jitter_y,
+                                                  vr_depth.frame, vr_dlss_tiles)) {
+          if (vr_dlss_tiles) {
+            vr_depth.samples = vr_depth_samples;
+            vr_depth.source_y = (int32_t(tl_y) + window_y) * int32_t(scale_y);
+            vr_depth.target_y = int32_t(tl_y * scale_y);
+            vr_depth.rows = (br_y - tl_y) * scale_y;
+          }
           vr_depth.width = vr_output_width_ * render_target_cache_->draw_resolution_scale_x();
           vr_depth.height = vr_output_height_ * render_target_cache_->draw_resolution_scale_y();
           EndRenderPass();  // a compute pass
@@ -6000,8 +6045,11 @@ bool VulkanCommandProcessor::IssueCopy() {
                   uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base),
                   uint32_t(regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_format),
                   written_address, written_length);
-      REXGPU_INFO("vr frame resolve copy: dest info {:08X} control {:08X}", regs[XE_GPU_REG_RB_COPY_DEST_INFO],
-                  regs[XE_GPU_REG_RB_COPY_CONTROL]);
+      REXGPU_INFO("vr frame resolve copy: dest info {:08X} control {:08X} window offset {:08X} scissor {:08X} {:08X} "
+                  "su mode {:08X}",
+                  regs[XE_GPU_REG_RB_COPY_DEST_INFO], regs[XE_GPU_REG_RB_COPY_CONTROL],
+                  regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                  regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL]);
     }
     return resolved;
   }

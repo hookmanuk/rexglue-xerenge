@@ -105,6 +105,9 @@ namespace shaders {
 const uint32_t kMotion[] = {
 #include "shaders/vr_dlss_motion.inc"
 };
+const uint32_t kMotionMultisampled[] = {
+#include "shaders/vr_dlss_motion_ms.inc"
+};
 }  // namespace shaders
 
 #define VR_DLSS_FUNCTIONS             \
@@ -139,6 +142,7 @@ struct Device {
   VkDescriptorSetLayout motion_set_layout = VK_NULL_HANDLE;
   VkPipelineLayout motion_layout = VK_NULL_HANDLE;
   VkPipeline motion_pipeline = VK_NULL_HANDLE;
+  VkPipeline motion_pipeline_ms = VK_NULL_HANDLE;  // a multisampled depth (sample 0)
 } d;
 
 bool LoadDevice(VkInstance instance, VkPhysicalDevice physical_device, VkDevice device,
@@ -189,9 +193,17 @@ bool LoadDevice(VkInstance instance, VkPhysicalDevice physical_device, VkDevice 
   pipeline.stage.module = module;
   pipeline.stage.pName = "main";
   pipeline.layout = d.motion_layout;
-  const bool made =
+  bool made =
       d.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &d.motion_pipeline) == VK_SUCCESS;
   d.vkDestroyShaderModule(device, module, nullptr);
+  module_info.codeSize = sizeof(shaders::kMotionMultisampled);
+  module_info.pCode = shaders::kMotionMultisampled;
+  if (made && d.vkCreateShaderModule(device, &module_info, nullptr, &module) == VK_SUCCESS) {
+    pipeline.stage.module = module;
+    made = d.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &d.motion_pipeline_ms) ==
+           VK_SUCCESS;
+    d.vkDestroyShaderModule(device, module, nullptr);
+  }
   return made;
 }
 
@@ -593,6 +605,16 @@ void NoteSceneDraw(const float* world, const float* world_view_projection) {
   }
 }
 
+bool WorldFromCamera(const float* world_view_projection, float* world) {
+  // WVP = world x VP (row vectors): world = WVP x VP^-1, with this frame's camera.
+  float inverse[16];
+  if (!g.ready || !objects.have_frame_vp || !Invert(objects.frame_vp, inverse)) {
+    return false;
+  }
+  Multiply(world_view_projection, inverse, world);
+  return true;
+}
+
 void SetObjectMotionImage(VkImage image, VkImageView view, uint32_t width, uint32_t height) {
   objects.image = image;
   objects.view = view;
@@ -656,7 +678,7 @@ bool DrawMotion(uint64_t key, const float* world, const float* world_view_projec
   return true;
 }
 
-bool TakeSceneCamera(float (&view_projection)[16], float& jitter_x, float& jitter_y, uint32_t& frame) {
+bool TakeSceneCamera(float (&view_projection)[16], float& jitter_x, float& jitter_y, uint32_t& frame, bool every) {
   if (!g.ready || !scene.valid) {
     return false;
   }
@@ -677,7 +699,8 @@ bool TakeSceneCamera(float (&view_projection)[16], float& jitter_x, float& jitte
   } else {
     std::memcpy(scene.first_vp, scene.vp, sizeof(scene.vp));
   }
-  if (++scene.resolves < scene.last_frame_resolves) {  // a later one comes (as last frame)
+  // A tiled frame (every: predicated tiling) takes each tile's: each has its own rows of the depth.
+  if (++scene.resolves < scene.last_frame_resolves && !every) {  // a later one comes (as last frame)
     scene.valid = false;
     return false;
   }
@@ -708,7 +731,8 @@ bool CameraCut(const float* clip_to_prev) {
 
 void RecordDepthMotion(VkCommandBuffer cmd, VkImage depth_image, VkImageView depth_view, VkImageLayout layout,
                        uint32_t width, uint32_t height, const float* view_projection, float jitter_x,
-                       float jitter_y, uint32_t frame) {
+                       float jitter_y, uint32_t frame, uint32_t samples, int32_t source_y, int32_t target_y,
+                       uint32_t rows) {
   const int index = ReplayEye();
   Eye& eye = eyes[index];
   if (!g.ready || !EnsureEye(eye, width, height, frame)) {
@@ -727,9 +751,15 @@ void RecordDepthMotion(VkCommandBuffer cmd, VkImage depth_image, VkImageView dep
     float size[2];
     float jitter[2];
     float tag;  // this frame's object motion entries
-    float pad[3];
+    int32_t source_y, target_y;  // a tile's rows: from the render target's, to the frame's
+    uint32_t rows;               // 0: all
   } push{};
   push.tag = float(frame);
+  push.source_y = source_y;
+  push.target_y = target_y;
+  push.rows = rows;
+  // A later tile of this frame keeps the rows the earlier ones wrote.
+  const bool later_tile = rows && eye.depth_ready && eye.previous_tag == frame;
   float inverse[16];
   if (eye.have_previous && eye.previous_tag == frame) {  // a later depth this frame: from where the first started
     std::memcpy(eye.previous_vp, eye.previous_vp_before, sizeof(vp));
@@ -766,11 +796,13 @@ void RecordDepthMotion(VkCommandBuffer cmd, VkImage depth_image, VkImageView dep
   const VkImageAspectFlags depth_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
   Barrier(cmd, depth_image, depth_aspects, layout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
           VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-  Barrier(cmd, eye.depth.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-          VK_ACCESS_SHADER_WRITE_BIT);
-  Barrier(cmd, eye.motion.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-          VK_ACCESS_SHADER_WRITE_BIT);
-  d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.motion_pipeline);
+  Barrier(cmd, eye.depth.image, VK_IMAGE_ASPECT_COLOR_BIT,
+          later_tile ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+          later_tile ? VK_ACCESS_SHADER_WRITE_BIT : 0, VK_ACCESS_SHADER_WRITE_BIT);
+  Barrier(cmd, eye.motion.image, VK_IMAGE_ASPECT_COLOR_BIT,
+          later_tile ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+          later_tile ? VK_ACCESS_SHADER_WRITE_BIT : 0, VK_ACCESS_SHADER_WRITE_BIT);
+  d.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, samples > 1 ? d.motion_pipeline_ms : d.motion_pipeline);
   const VkDescriptorImageInfo source{d.sampler, depth_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
   const VkDescriptorImageInfo depth_out{VK_NULL_HANDLE, eye.depth.view, VK_IMAGE_LAYOUT_GENERAL};
   const VkDescriptorImageInfo motion_out{VK_NULL_HANDLE, eye.motion.view, VK_IMAGE_LAYOUT_GENERAL};
@@ -798,7 +830,7 @@ void RecordDepthMotion(VkCommandBuffer cmd, VkImage depth_image, VkImageView dep
   d.vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, d.motion_layout, 0, objects.view ? 4 : 3,
                               writes);
   d.vkCmdPushConstants(cmd, d.motion_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
-  d.vkCmdDispatch(cmd, (width + 7) / 8, (height + 7) / 8, 1);
+  d.vkCmdDispatch(cmd, (width + 7) / 8, ((rows ? rows : height) + 7) / 8, 1);
   Barrier(cmd, depth_image, depth_aspects, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, layout,
           VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
   eye.depth_ready = true;

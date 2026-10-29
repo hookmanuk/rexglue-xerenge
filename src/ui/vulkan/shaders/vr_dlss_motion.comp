@@ -3,25 +3,38 @@
 // and the camera's motion in render pixels, this frame to the previous one, without the jitter (DLSS gets it apart).
 // clip_to_prev maps this frame's guest clip space (x right, y up, z 0..1) to the previous frame's; it is uploaded
 // row-major (RAGE's row vectors), so m * v here is the game's v * M.
+// A frame drawn in tiles (predicated tiling) gives one call a tile: its rows of the target from source_y in the
+// render target to target_y in the frame; MULTISAMPLED (vr_dlss_motion_ms.inc) reads sample 0 of a multisampled depth.
 // glslangValidator -V --target-env vulkan1.1 -x -o vr_dlss_motion.inc vr_dlss_motion.comp
+// glslangValidator -V --target-env vulkan1.1 -x -DMULTISAMPLED -o vr_dlss_motion_ms.inc vr_dlss_motion.comp
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef MULTISAMPLED
+layout(binding = 0) uniform sampler2DMS depth_source;
+#else
 layout(binding = 0) uniform sampler2D depth_source;
+#endif
 layout(binding = 1, r32f) uniform writeonly image2D depth_target;
 layout(binding = 2, rg16f) uniform writeonly image2D motion_target;
-// The draws' own motion (their pixel shaders store motion, depth and the frame's tag; vr_dlss DrawMotion).
+// The draws' own motion (their pixel shaders store motion, depth and the frame's tag; vr_dlss DrawMotion), in the
+// render target's pixels.
 layout(binding = 3, rgba32f) uniform readonly image2D object_motion;
 layout(push_constant) uniform Constants {
   mat4 clip_to_prev;
-  vec2 size;    // render pixels
+  vec2 size;    // render pixels, the whole frame
   vec2 jitter;  // this frame's, guest NDC
   float tag;
+  int source_y;  // the first row's place in the render target
+  int target_y;  // and in the frame
+  int rows;      // 0: the whole frame
 } constants;
 void main() {
-  const ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-  if (any(greaterThanEqual(vec2(xy), constants.size))) {
+  const ivec2 local = ivec2(gl_GlobalInvocationID.xy);
+  const ivec2 xy = local + ivec2(0, constants.target_y);
+  if (any(greaterThanEqual(vec2(xy), constants.size)) || (constants.rows > 0 && local.y >= constants.rows)) {
     return;
   }
-  const float depth = texelFetch(depth_source, xy, 0).r;
+  const ivec2 source = local + ivec2(0, constants.source_y);
+  const float depth = texelFetch(depth_source, source, 0).r;
   imageStore(depth_target, xy, vec4(depth));
   // The pixel's centre in guest NDC (the image has y down), the jitter taken out.
   vec2 ndc = (vec2(xy) + 0.5) / constants.size * 2.0 - 1.0;
@@ -32,7 +45,7 @@ void main() {
   vec2 motion = (previous_ndc - ndc) * 0.5 * constants.size;
   motion.y = -motion.y;
   // A draw's own motion where it is the visible surface (its depth is the scene's) this frame.
-  const vec4 object = imageLoad(object_motion, xy);
+  const vec4 object = imageLoad(object_motion, source);
   if (object.w == constants.tag && abs(object.z - depth) <= 1e-5 + 1e-4 * depth) {
     motion = object.xy;
   }

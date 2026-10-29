@@ -27,13 +27,19 @@ void FrameJitter(float& x, float& y);
 /// vectors. The frame's view-projection is world^-1 x WVP (the latest such draw's).
 void NoteSceneDraw(const float* world, const float* world_view_projection);
 /// The GPU thread at the scene's resolve: the frame's view-projection (row-major) and jitter (NDC), for the depth
-/// pass; false when DLSS is off or no scene draw was seen.
-bool TakeSceneCamera(float (&view_projection)[16], float& jitter_x, float& jitter_y, uint32_t& frame);
+/// pass; false when DLSS is off or no scene draw was seen. `every`: each resolve takes it (a frame in tiles).
+bool TakeSceneCamera(float (&view_projection)[16], float& jitter_x, float& jitter_y, uint32_t& frame,
+                     bool every = false);
+/// A rigid draw's world (row vectors) from its WVP and this frame's camera (the latest NoteSceneDraw's): false before
+/// the frame has one.
+bool WorldFromCamera(const float* world_view_projection, float* world);
 /// Replay (each eye): the scene's depth (a depth-aspect view of `depth_image` in `layout`) to the eye's DLSS depth,
-/// with its camera motion (this frame's view-projection and jitter, the previous frame's kept per eye).
+/// with its camera motion (this frame's view-projection and jitter, the previous frame's kept per eye). `samples`:
+/// the depth's (sample 0 read); `rows` (0: all): a tile's rows, from `source_y` in the depth to `target_y` in the frame.
 void RecordDepthMotion(VkCommandBuffer cmd, VkImage depth_image, VkImageView depth_view, VkImageLayout layout,
                        uint32_t width, uint32_t height, const float* view_projection, float jitter_x, float jitter_y,
-                       uint32_t frame);
+                       uint32_t frame, uint32_t samples = 1, int32_t source_y = 0, int32_t target_y = 0,
+                       uint32_t rows = 0);
 /// Setup: the object motion image the pixel shaders write (set 0, binding 2), `width` x `height` at least the render
 /// size; its twin is the right eye's.
 void SetObjectMotionImage(VkImage image, VkImageView view, uint32_t width, uint32_t height);

@@ -101,6 +101,9 @@ class DeferredCommandBuffer {
     float view_projection[16];
     float jitter_x, jitter_y;
     uint32_t frame;  // the GPU thread's frame (replay runs behind it)
+    uint32_t samples = 1;  // the depth's (sample 0 read)
+    int32_t source_y = 0, target_y = 0;  // a tile's rows (rows 0: the whole frame)
+    uint32_t rows = 0;
   };
   void CmdVrDlssDepth(const ArgsVrDlssDepth& args) {
     *reinterpret_cast<ArgsVrDlssDepth*>(WriteCommand(Command::kVrDlssDepth, sizeof(ArgsVrDlssDepth))) = args;

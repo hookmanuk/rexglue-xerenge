@@ -416,7 +416,8 @@ void DeferredCommandBuffer::ExecuteRange(VkCommandBuffer command_buffer, const u
       case Command::kVrDlssDepth: {
         const auto& args = *reinterpret_cast<const ArgsVrDlssDepth*>(stream);
         ui::vulkan::vr::dlss::RecordDepthMotion(command_buffer, args.image, args.view, args.layout, args.width,
-                                                args.height, args.view_projection, args.jitter_x, args.jitter_y, args.frame);
+                                                args.height, args.view_projection, args.jitter_x, args.jitter_y, args.frame,
+                                                args.samples, args.source_y, args.target_y, args.rows);
       } break;
 
       case Command::kVrMark: {
