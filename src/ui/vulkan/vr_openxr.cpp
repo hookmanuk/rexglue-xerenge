@@ -1877,6 +1877,32 @@ void SetFramePose(const float (&pose)[16], const float (&tangents)[4]) {
 std::atomic<uint64_t> g_game_swaps{0};
 uint64_t GameSwapCount() { return g_game_swaps.load(std::memory_order_relaxed); }
 
+namespace {
+struct FrameInterpolationEntry {
+  uint64_t frame = ~0ull;
+  double state = 0.0;
+  float t = 1.f;
+};
+std::mutex g_interpolation_mutex;
+std::array<FrameInterpolationEntry, 64> g_interpolation;
+}  // namespace
+
+void SetFrameInterpolation(uint64_t frame, double state, float t) {
+  std::scoped_lock lock{g_interpolation_mutex};
+  g_interpolation[frame % g_interpolation.size()] = {frame, state, t};
+}
+
+bool FrameInterpolation(uint64_t frame, double& state, float& t) {
+  std::scoped_lock lock{g_interpolation_mutex};
+  const FrameInterpolationEntry& e = g_interpolation[frame % g_interpolation.size()];
+  if (e.frame != frame) {
+    return false;
+  }
+  state = e.state;
+  t = e.t;
+  return true;
+}
+
 void OnGameSwap(uint32_t frontbuffer) {
   g_game_swaps.fetch_add(1, std::memory_order_relaxed);
   if (!Active()) {

@@ -18,6 +18,7 @@
 #include <rex/ui/renderdoc_api.h>
 #include <filesystem>
 #include <array>
+#include <unordered_map>
 #include <cstdint>
 #include <cstring>
 #include <iterator>
@@ -2820,6 +2821,92 @@ bool VulkanCommandProcessor::VrHudDraw(const Shader* vertex_shader) {
 // each), and whether as the rows of a row-vector matrix (RAGE: MCLA's c0 and c8) or transposed (clip.i = dot(c_i,
 // position): Burnout Revenge's gObjToWorldMatrix c15 and gObjToProjMatrix c0). Set by the game at start.
 
+// VR fork: MCLA_VR_CAMERA_VS (rigid draws, vr_world_constant -1): the vertex shaders whose WVP is the camera's
+// view-projection (the static world's, Burnout); the rest take their world from it.
+const std::vector<uint64_t>& VrCameraVertexShaders() {
+  static const std::vector<uint64_t> list = [] {
+    std::vector<uint64_t> hashes;
+    if (const char* v = std::getenv("MCLA_VR_CAMERA_VS")) {
+      for (const char* p = v; *p;) {
+        char* end;
+        const uint64_t hash = std::strtoull(p, &end, 16);
+        if (end == p) {
+          break;
+        }
+        hashes.push_back(hash);
+        p = *end == ',' ? end + 1 : end;
+      }
+    }
+    return hashes;
+  }();
+  return list;
+}
+
+namespace {
+// VR fork: 4x4 row-major helpers for the interpolation between logic steps.
+void VrMultiply(const float* a, const float* b, float* out) {
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      out[r * 4 + c] = a[r * 4] * b[c] + a[r * 4 + 1] * b[4 + c] + a[r * 4 + 2] * b[8 + c] + a[r * 4 + 3] * b[12 + c];
+    }
+  }
+}
+bool VrInvert(const float* m, float* out) {
+  double inv[16];
+  inv[0] = double(m[5]) * m[10] * m[15] - double(m[5]) * m[11] * m[14] - double(m[9]) * m[6] * m[15] +
+           double(m[9]) * m[7] * m[14] + double(m[13]) * m[6] * m[11] - double(m[13]) * m[7] * m[10];
+  inv[4] = -double(m[4]) * m[10] * m[15] + double(m[4]) * m[11] * m[14] + double(m[8]) * m[6] * m[15] -
+           double(m[8]) * m[7] * m[14] - double(m[12]) * m[6] * m[11] + double(m[12]) * m[7] * m[10];
+  inv[8] = double(m[4]) * m[9] * m[15] - double(m[4]) * m[11] * m[13] - double(m[8]) * m[5] * m[15] +
+           double(m[8]) * m[7] * m[13] + double(m[12]) * m[5] * m[11] - double(m[12]) * m[7] * m[9];
+  inv[12] = -double(m[4]) * m[9] * m[14] + double(m[4]) * m[10] * m[13] + double(m[8]) * m[5] * m[14] -
+            double(m[8]) * m[6] * m[13] - double(m[12]) * m[5] * m[10] + double(m[12]) * m[6] * m[9];
+  inv[1] = -double(m[1]) * m[10] * m[15] + double(m[1]) * m[11] * m[14] + double(m[9]) * m[2] * m[15] -
+           double(m[9]) * m[3] * m[14] - double(m[13]) * m[2] * m[11] + double(m[13]) * m[3] * m[10];
+  inv[5] = double(m[0]) * m[10] * m[15] - double(m[0]) * m[11] * m[14] - double(m[8]) * m[2] * m[15] +
+           double(m[8]) * m[3] * m[14] + double(m[12]) * m[2] * m[11] - double(m[12]) * m[3] * m[10];
+  inv[9] = -double(m[0]) * m[9] * m[15] + double(m[0]) * m[11] * m[13] + double(m[8]) * m[1] * m[15] -
+           double(m[8]) * m[3] * m[13] - double(m[12]) * m[1] * m[11] + double(m[12]) * m[3] * m[9];
+  inv[13] = double(m[0]) * m[9] * m[14] - double(m[0]) * m[10] * m[13] - double(m[8]) * m[1] * m[14] +
+            double(m[8]) * m[2] * m[13] + double(m[12]) * m[1] * m[10] - double(m[12]) * m[2] * m[9];
+  inv[2] = double(m[1]) * m[6] * m[15] - double(m[1]) * m[7] * m[14] - double(m[5]) * m[2] * m[15] +
+           double(m[5]) * m[3] * m[14] + double(m[13]) * m[2] * m[7] - double(m[13]) * m[3] * m[6];
+  inv[6] = -double(m[0]) * m[6] * m[15] + double(m[0]) * m[7] * m[14] + double(m[4]) * m[2] * m[15] -
+           double(m[4]) * m[3] * m[14] - double(m[12]) * m[2] * m[7] + double(m[12]) * m[3] * m[6];
+  inv[10] = double(m[0]) * m[5] * m[15] - double(m[0]) * m[7] * m[13] - double(m[4]) * m[1] * m[15] +
+            double(m[4]) * m[3] * m[13] + double(m[12]) * m[1] * m[7] - double(m[12]) * m[3] * m[5];
+  inv[14] = -double(m[0]) * m[5] * m[14] + double(m[0]) * m[6] * m[13] + double(m[4]) * m[1] * m[14] -
+            double(m[4]) * m[2] * m[13] - double(m[12]) * m[1] * m[6] + double(m[12]) * m[2] * m[5];
+  inv[3] = -double(m[1]) * m[6] * m[11] + double(m[1]) * m[7] * m[10] + double(m[5]) * m[2] * m[11] -
+           double(m[5]) * m[3] * m[10] - double(m[9]) * m[2] * m[7] + double(m[9]) * m[3] * m[6];
+  inv[7] = double(m[0]) * m[6] * m[11] - double(m[0]) * m[7] * m[10] - double(m[4]) * m[2] * m[11] +
+           double(m[4]) * m[3] * m[10] + double(m[8]) * m[2] * m[7] - double(m[8]) * m[3] * m[6];
+  inv[11] = -double(m[0]) * m[5] * m[11] + double(m[0]) * m[7] * m[9] + double(m[4]) * m[1] * m[11] -
+            double(m[4]) * m[3] * m[9] - double(m[8]) * m[1] * m[7] + double(m[8]) * m[3] * m[5];
+  inv[15] = double(m[0]) * m[5] * m[10] - double(m[0]) * m[6] * m[9] - double(m[4]) * m[1] * m[10] +
+            double(m[4]) * m[2] * m[9] + double(m[8]) * m[1] * m[6] - double(m[8]) * m[2] * m[5];
+  const double det = double(m[0]) * inv[0] + double(m[1]) * inv[4] + double(m[2]) * inv[8] + double(m[3]) * inv[12];
+  if (std::abs(det) < 1e-30) {
+    return false;
+  }
+  for (int i = 0; i < 16; ++i) {
+    out[i] = float(inv[i] / det);
+  }
+  return true;
+}
+// The GPU thread's: each moving draw's world at the logic state the frame draws and the one before.
+struct VrInterpolation {
+  uint64_t frame = ~0ull;  // the GPU frame `counters` count
+  double state = -1.0;     // the logic state `curr` holds
+  bool recording = false;  // the state's first frame: its draws go into `curr`
+  float vp[16]{}, vp_inverse[16]{};
+  bool have_vp = false;  // this frame's camera
+  std::unordered_map<uint64_t, std::vector<std::array<float, 16>>> curr, prev;
+  std::unordered_map<uint64_t, uint32_t> counters;
+  uint64_t interpolated = 0, draws = 0;
+} g_vr_interpolation;
+}  // namespace
+
 // VR fork: a matrix of the draw's vertex constants (VrDrawMatrix: the world or world-view-projection), as row vectors.
 void VulkanCommandProcessor::VrDrawMatrix(bool world_view_projection, float (&out)[16]) const {
   const RegisterFile& regs = *register_file_;
@@ -3097,6 +3184,11 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
                     g_vr_px_stats[3] / f, g_vr_px_stats[4] / 1e6 / f, g_vr_px_stats[5] / f,
                     g_vr_px_stats[6] / 1e6 / f, g_vr_px_stats[7] / f);
         std::memset(g_vr_px_stats, 0, sizeof(g_vr_px_stats));
+        if (g_vr_interpolation.draws) {  // VR fork: drawing between logic steps
+          REXGPU_INFO("  between logic steps: {:.1f} draws/frame moved, of {:.1f} scene draws", g_vr_interpolation.interpolated / f,
+                      g_vr_interpolation.draws / f);
+          g_vr_interpolation.interpolated = g_vr_interpolation.draws = 0;
+        }
         extern void VrLogTransferKinds(uint32_t frames);
         VrLogTransferKinds(std::max(1u, frames));
         extern uint64_t g_vr_stencil_draws[2];
@@ -4758,6 +4850,125 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       }
     }
   }
+  // VR fork: drawing between logic steps (vr::SetFrameInterpolation: logic at 60 steps a second under the headset's
+  // faster frames). The game turns its camera to the frame's moment itself; each moving draw of the scene goes from
+  // where it was at the state before to where it is: its world (its WVP over this frame's camera, the WVP of
+  // MCLA_VR_CAMERA_VS's draws) at t between the two, times the camera. Restored after the draw. Rigid draws only
+  // (vr_world_constant -1). MCLA_VR_INTERPOLATE=0: off.
+  struct VrMatrixPatch {
+    VulkanCommandProcessor* processor = nullptr;
+    uint32_t values[16] = {};
+    uint32_t first = 0;
+    ~VrMatrixPatch() {
+      for (uint32_t i = 0; processor && i < 16; ++i) {
+        processor->WriteRegister(first + i, values[i]);
+      }
+    }
+  } vr_interpolation_patch;
+  static const bool vr_interpolate =
+      !(std::getenv("MCLA_VR_INTERPOLATE") && std::getenv("MCLA_VR_INTERPOLATE")[0] == '0');
+  if (vr_interpolate && ui::vulkan::vr::Stereo() && vr_output_width_ && REXCVAR_GET(vr_world_constant) < 0 &&
+      !VrCameraVertexShaders().empty() && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == vr_output_width_ &&
+      regs.Get<reg::RB_DEPTHCONTROL>().z_enable) {
+    VrInterpolation& vi = g_vr_interpolation;
+    double state;
+    float t;
+    const uint64_t frame = vr_log_swap_count_;
+    if (ui::vulkan::vr::FrameInterpolation(frame, state, t)) {
+      if (frame != vi.frame) {  // the frame's first scene draw
+        vi.frame = frame;
+        vi.counters.clear();
+        vi.have_vp = false;
+        vi.recording = state != vi.state;
+        if (vi.recording) {
+          if (state > vi.state && state - vi.state <= 4.0) {
+            vi.prev = std::move(vi.curr);
+          } else {
+            vi.prev.clear();  // the timer started over, or a long gap
+          }
+          vi.curr.clear();
+          vi.state = state;
+        }
+      }
+      float wvp[16];
+      VrDrawMatrix(true, wvp);
+      const bool perspective =
+          std::abs(wvp[3]) + std::abs(wvp[7]) + std::abs(wvp[11]) > 1e-4f || std::abs(wvp[15] - 1.f) > 1e-4f;
+      const std::vector<uint64_t>& camera_vs = VrCameraVertexShaders();
+      if (perspective &&
+          std::find(camera_vs.begin(), camera_vs.end(), vertex_shader->ucode_data_hash()) != camera_vs.end()) {
+        if (!vi.have_vp) {
+          std::memcpy(vi.vp, wvp, sizeof(wvp));
+          vi.have_vp = VrInvert(vi.vp, vi.vp_inverse);
+        }
+      } else if (perspective && vi.have_vp) {
+        float world[16];
+        VrMultiply(wvp, vi.vp_inverse, world);
+        uint64_t key = vertex_shader->ucode_data_hash() * 0x9E3779B97F4A7C15ull ^
+                       (pixel_shader ? pixel_shader->ucode_data_hash() : 0);
+        if (!vertex_shader->vertex_bindings().empty()) {
+          key = key * 31 + regs.GetVertexFetch(vertex_shader->vertex_bindings()[0].fetch_constant).address;
+        }
+        key = key * 31 + (index_buffer_info ? index_buffer_info->guest_base : 0);
+        key = key * 31 + index_count;
+        const uint32_t index = vi.counters[key]++;
+        if (vi.recording) {
+          auto& list = vi.curr[key];
+          list.emplace_back();
+          std::memcpy(list.back().data(), world, sizeof(world));
+        }
+        ++vi.draws;
+        const auto before = vi.prev.find(key);
+        if (t < 0.999f && before != vi.prev.end()) {
+          // The same draw the state before: the same place among the mesh's draws when it is near enough (a step's
+          // travel, metres), else the nearest one that is.
+          const auto distance2 = [&](const std::array<float, 16>& m) {
+            const float x = m[12] - world[12], y = m[13] - world[13], z = m[14] - world[14];
+            return x * x + y * y + z * z;
+          };
+          constexpr float kStep2 = 4.f * 4.f;
+          const std::array<float, 16>* from = nullptr;
+          if (index < before->second.size() && distance2(before->second[index]) < kStep2) {
+            from = &before->second[index];
+          } else {
+            float nearest = kStep2;
+            for (const auto& m : before->second) {
+              if (const float d = distance2(m); d < nearest) {
+                nearest = d;
+                from = &m;
+              }
+            }
+          }
+          // Moved: by more than the rounding of a world taken back out of WVP (a millimetre, 1e-4 of the axes).
+          bool moved = false;
+          for (int i = 0; from && i < 16 && !moved; ++i) {
+            moved = std::abs((*from)[i] - world[i]) > (i >= 12 && i < 15 ? 1e-3f : 1e-4f);
+          }
+          if (moved) {
+            float between[16], out[16];
+            for (int i = 0; i < 16; ++i) {
+              between[i] = (*from)[i] + (world[i] - (*from)[i]) * t;
+            }
+            VrMultiply(between, vi.vp, out);
+            const uint32_t first = XE_GPU_REG_SHADER_CONSTANT_000_X + uint32_t(REXCVAR_GET(vr_wvp_constant)) * 4;
+            vr_interpolation_patch.processor = this;
+            vr_interpolation_patch.first = first;
+            const bool transposed = REXCVAR_GET(vr_constants_transposed);
+            for (int r = 0; r < 4; ++r) {
+              for (int c = 0; c < 4; ++c) {
+                const uint32_t reg = transposed ? uint32_t(c * 4 + r) : uint32_t(r * 4 + c);
+                vr_interpolation_patch.values[reg] = regs[first + reg];
+                uint32_t bits;
+                std::memcpy(&bits, &out[r * 4 + c], sizeof(bits));
+                WriteRegister(first + reg, bits);
+              }
+            }
+            ++vi.interpolated;
+          }
+        }
+      }
+    }
+  }
   // VR fork, development: MCLA_VR_PS_CONST="HASH:252.w=0;HASH:69.x=1.5" sets pixel shader constants for that
   // shader's draws (restored after the draw); MCLA_VR_PS_CONST_LOG=HASH logs the constants it reads every 600 frames.
   struct VrConstantPatch {
@@ -5529,21 +5740,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
       VrDrawMatrix(true, world_view_projection);
       // MCLA_VR_CAMERA_VS (rigid draws, vr_world_constant -1): the vertex shaders whose WVP is the camera's
       // view-projection (the static world's, Burnout); the rest take their world from it (their own motion).
-      static const std::vector<uint64_t> vr_camera_vs = [] {
-        std::vector<uint64_t> list;
-        if (const char* v = std::getenv("MCLA_VR_CAMERA_VS")) {
-          for (const char* p = v; *p;) {
-            char* end;
-            const uint64_t hash = std::strtoull(p, &end, 16);
-            if (end == p) {
-              break;
-            }
-            list.push_back(hash);
-            p = *end == ',' ? end + 1 : end;
-          }
-        }
-        return list;
-      }();
+      const std::vector<uint64_t>& vr_camera_vs = VrCameraVertexShaders();
       const bool vr_camera_listed = !vr_camera_vs.empty();
       if (!vr_camera_listed || std::find(vr_camera_vs.begin(), vr_camera_vs.end(),
                                          vertex_shader->ucode_data_hash()) != vr_camera_vs.end()) {

@@ -113,6 +113,13 @@ void OnGameSwap(uint32_t frontbuffer);
 /// paces only once per swap.
 uint64_t GameSwapCount();
 
+/// Drawing between logic steps (a game whose logic steps at a fixed rate under faster frames): the game, building
+/// frame `frame` (its GameSwapCount()), says which logic state it draws (`state`, counting up a step at a time) and
+/// where between the state before and it the frame's moment is (`t`, 0..1; 1: the state as it is). The GPU thread
+/// reads it for the same frame (its swaps so far): FrameInterpolation, false when none was set.
+void SetFrameInterpolation(uint64_t frame, double state, float t);
+bool FrameInterpolation(uint64_t frame, double& state, float& t);
+
 /// The GPU thread, each swap packet (IssueSwap): the pose of the frame it presents, matched by its frontbuffer (by
 /// order alone a swap queued at start without a packet left every later frame with the previous frame's pose: the
 /// world moved when the head turned).
