@@ -55,7 +55,8 @@
 
 // Legacy backend compatibility aliases for shared readback controls.
 // VR fork: the draw's matrices' registers (VrDrawMatrix).
-REXCVAR_DEFINE_INT32(vr_world_constant, 0, "VR", "Vertex shader register of the draw's world matrix (VR)");
+REXCVAR_DEFINE_INT32(vr_world_constant, 0, "VR",
+                     "Vertex shader register of the draw's world matrix (VR); -1: none, taken as rigid");
 REXCVAR_DEFINE_INT32(vr_wvp_constant, 8, "VR", "Vertex shader register of the draw's world-view-projection (VR)");
 REXCVAR_DEFINE_BOOL(vr_constants_transposed, false, "VR",
                     "The world and world-view-projection registers hold the matrices transposed (VR)");
@@ -2822,6 +2823,14 @@ bool VulkanCommandProcessor::VrHudDraw(const Shader* vertex_shader) {
 // VR fork: a matrix of the draw's vertex constants (VrDrawMatrix: the world or world-view-projection), as row vectors.
 void VulkanCommandProcessor::VrDrawMatrix(bool world_view_projection, float (&out)[16]) const {
   const RegisterFile& regs = *register_file_;
+  if (!world_view_projection && REXCVAR_GET(vr_world_constant) < 0) {
+    // No world register (vr_world_constant -1): taken as rigid, the identity for the projection's scale (Burnout's
+    // shaders keep a world matrix in only a few of them).
+    for (int i = 0; i < 16; ++i) {
+      out[i] = (i % 5) == 0 ? 1.f : 0.f;
+    }
+    return;
+  }
   const uint32_t first = uint32_t(world_view_projection ? REXCVAR_GET(vr_wvp_constant) : REXCVAR_GET(vr_world_constant));
   float m[16];
   std::memcpy(m, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + std::min(first, 252u) * 4], sizeof(m));
@@ -5603,7 +5612,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t 
                 regs[XE_GPU_REG_RB_COLOR_MASK] & 0xF, blend0.value, uint32_t(depth.depth_base),
                 uint32_t(regs.Get<reg::RB_DEPTHCONTROL>().z_enable), index_count);
     std::string constants;
-    for (uint32_t i = 0; i < 16 * 4; ++i) {
+    for (uint32_t i = 0; i < 24 * 4; ++i) {
       float f;
       std::memcpy(&f, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i], 4);
       constants += fmt::format("{:.3g}{}", f, i % 4 == 3 ? " | " : " ");
