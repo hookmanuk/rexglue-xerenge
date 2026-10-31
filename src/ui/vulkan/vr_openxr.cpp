@@ -253,6 +253,9 @@ struct State {
   // Pacing (Driveclub's): the headset's refresh period, the adaptive cap, a token per headset frame.
   std::atomic<uint64_t> display_period_ns{0};
   std::atomic<uint64_t> refresh_period_ns{0};
+  // The timer pacing's phase against the headset's frames (PaceSwap; the loop's measure, FrameLoop): nanoseconds to
+  // move the game's next frame by, taken at its next swap.
+  std::atomic<int64_t> pace_shift_ns{0};
   std::atomic<bool> capped{false};
   // Slow frames (the game under 80% of the headset's rate, back at 95%, or the frame cap on): rendered this much wider
   // than the eyes' field of view, so the runtime has picture to turn into before the next frame (else a head turn
@@ -1336,6 +1339,28 @@ bool Finished(const State::Published& p) {
 // After xrWaitFrame: waits (up to 100 ms) until the GPU has finished a game frame newer than the one shown, so a slow
 // game makes the headset frame late and the runtime sees it (Driveclub recomp c5c0dc6: the output rate is the
 // game's). The ticks count the frames: the next one's tick is the shown one's plus one.
+// The timer pacing (PaceSwap with the token off) runs the game at the headset's period, but on its own clock: the two
+// drift past each other, and while the game's frame came at the end of the headset's slot (the loop waiting the whole
+// period for it) or the phase wrapped, slots went without a new frame (Burnout, simulator 72 Hz, 3840x4320: 12-59 of
+// ~920 a 12 s window, the loop's wait for the game sliding 5.4 -> 0.4 -> 13 -> 0 ms; Matt 2026-10-31, SteamVR: "ensure
+// 1 real frame is always sent for 1 steamVR frame"). Locked here: the game's frame ready a quarter period into the
+// slot; later moves the game's next frame earlier by a fifth of the difference, ready before the slot (no wait) later
+// by 0.3 ms. MCLA_VR_PHASE_LOCK=0: off.
+void PhaseLockGame(std::chrono::steady_clock::duration waited) {
+  static const bool enabled = !(std::getenv("MCLA_VR_PHASE_LOCK") && std::getenv("MCLA_VR_PHASE_LOCK")[0] == '0');
+  static const bool token_pacing = !(std::getenv("MCLA_VR_PACE_TOKEN") && std::getenv("MCLA_VR_PACE_TOKEN")[0] == '0');
+  const uint64_t refresh = g.refresh_period_ns.load(std::memory_order_relaxed);
+  const int64_t period = int64_t(refresh ? refresh : g.display_period_ns.load(std::memory_order_relaxed));
+  if (!enabled || token_pacing || REXCVAR_GET(vr_frame_cap) > 1 || !g.capped.load(std::memory_order_relaxed) ||
+      period <= 0) {
+    return;
+  }
+  const int64_t w = std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count();
+  const int64_t target = period / 4;
+  const int64_t shift = w < 200'000 ? 300'000 : std::clamp<int64_t>(-(w - target) / 5, -1'000'000, 1'000'000);
+  g.pace_shift_ns.fetch_add(shift, std::memory_order_relaxed);
+}
+
 void WaitForGameFrame() {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   uint64_t next_tick = 0;
@@ -1400,6 +1425,7 @@ void FrameLoop() {
       continue;
     }
     trace_first_time = g.frame_state.predictedDisplayTime;
+    const auto slot_start = std::chrono::steady_clock::now();
     stage(0);
     if (g.frame_state.predictedDisplayPeriod > 0) {
       const uint64_t period = uint64_t(g.frame_state.predictedDisplayPeriod);
@@ -1425,6 +1451,7 @@ void FrameLoop() {
     stage(2);
     WaitForGameFrame();
     stage(3);
+    PhaseLockGame(std::chrono::steady_clock::now() - slot_start);
     std::scoped_lock frame_lock{g.frame_mutex};
     {
       QueueLock lock;
@@ -2002,7 +2029,10 @@ void PaceSwap() {
       std::this_thread::yield();
     }
   }
-  next += period;
+  // Locked to the headset's frames (PhaseLockGame), at most a quarter period a frame.
+  const int64_t shift = std::clamp<int64_t>(g.pace_shift_ns.exchange(0, std::memory_order_relaxed),
+                                            -int64_t(period_ns) / 4, int64_t(period_ns) / 4);
+  next += period + std::chrono::nanoseconds(shift);
 }
 
 void Recenter() { g.recenter_requested = true; }
