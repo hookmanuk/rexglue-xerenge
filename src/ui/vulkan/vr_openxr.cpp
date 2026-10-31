@@ -1694,6 +1694,12 @@ void OnDeviceCreated(const VulkanDevice* device, PFN_vkGetInstanceProcAddr get_i
   g.thread = std::thread{FrameLoop};
 }
 
+void SetScreenAspect(float aspect) {
+  if (aspect > 0.f) {
+    g.hud_aspect.store(aspect, std::memory_order_relaxed);
+  }
+}
+
 int SplitFrame(uint32_t width, uint32_t height, float aspect) {
   if (g.split_screen >= 0) {
     return g.split_screen;

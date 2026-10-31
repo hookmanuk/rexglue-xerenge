@@ -158,5 +158,8 @@ bool HeadPose(float (&pose)[16], float (&tangents)[4]);
 /// As HeadPose, carried on to now from the headset loop's last two poses: a game whose frames don't fall one to a
 /// headset frame (60 Hz logic steps in some) gets a new pose for each.
 bool HeadPoseNow(float (&pose)[16], float (&tangents)[4]);
+/// The renderer's frame shape (height over width) for the screens shown flat (title, menus) and the HUD sheet; the
+/// default is 9/16, the console's output.
+void SetScreenAspect(float aspect);
 
 }  // namespace rex::ui::vulkan::vr
