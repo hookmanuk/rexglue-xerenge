@@ -121,6 +121,7 @@ struct VkFunctions {
   VK_FN(vkWaitSemaphores)                \
   VK_FN(vkCreateImageView)               \
   VK_FN(vkDestroyImageView)              \
+  VK_FN(vkCreateSampler)                 \
   VK_FN(vkCreateShaderModule)            \
   VK_FN(vkCreateDescriptorSetLayout)     \
   VK_FN(vkCreatePipelineLayout)          \
@@ -198,6 +199,19 @@ struct State {
   VkPipeline hud_pipeline{};
   VkDescriptorPool hud_pool{};
   VkDescriptorSet hud_sets[kScreens]{};
+  // The scene's sharpening (vr_scene_cas.comp, plume's CAS per eye; SetSceneSharpening), run by the headset's thread
+  // from a screen image into scene_fixed, copied into the swapchain bit for bit. 0: off (a plain copy).
+  std::atomic<float> scene_sharpening{0.f};
+  VkImageView screen_views[kScreens]{};
+  VkImage scene_fixed{};
+  VkDeviceMemory scene_fixed_memory{};
+  VkImageView scene_fixed_view{};
+  VkSampler cas_sampler{};
+  VkDescriptorSetLayout cas_set_layout{};
+  VkPipelineLayout cas_pipeline_layout{};
+  VkPipeline cas_pipeline{};
+  VkDescriptorPool cas_pool{};
+  VkDescriptorSet cas_sets[kScreens]{};
   int split_screen = -1;  // the GPU thread's: the screen of the frame being recorded, when split
   bool split_hud_captured = false;  // the GPU thread's: its HUD copy was recorded
 
@@ -631,6 +645,67 @@ bool MakeHudPipeline() {
   return g.vk.vkAllocateDescriptorSets(g.device, &allocate, g.hud_sets) == VK_SUCCESS;
 }
 
+// The scene sharpening pass's pipeline (once).
+bool MakeCasPipeline() {
+  if (g.cas_pipeline) {
+    return true;
+  }
+  static const uint32_t code[] = {
+#include "shaders/vr_scene_cas.inc"
+  };
+  VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  module_info.codeSize = sizeof(code);
+  module_info.pCode = code;
+  VkShaderModule module{};
+  if (g.vk.vkCreateShaderModule(g.device, &module_info, nullptr, &module) != VK_SUCCESS) {
+    return false;
+  }
+  VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sampler_info.magFilter = sampler_info.minFilter = VK_FILTER_NEAREST;
+  sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW =
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  g.vk.vkCreateSampler(g.device, &sampler_info, nullptr, &g.cas_sampler);
+  VkDescriptorSetLayoutBinding bindings[2]{};
+  bindings[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+  VkDescriptorSetLayoutCreateInfo set_info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+  set_info.bindingCount = 2;
+  set_info.pBindings = bindings;
+  g.vk.vkCreateDescriptorSetLayout(g.device, &set_info, nullptr, &g.cas_set_layout);
+  const VkPushConstantRange range{VK_SHADER_STAGE_COMPUTE_BIT, 0, 5 * sizeof(uint32_t)};
+  VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  layout_info.setLayoutCount = 1;
+  layout_info.pSetLayouts = &g.cas_set_layout;
+  layout_info.pushConstantRangeCount = 1;
+  layout_info.pPushConstantRanges = &range;
+  g.vk.vkCreatePipelineLayout(g.device, &layout_info, nullptr, &g.cas_pipeline_layout);
+  VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+  pipeline_info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  pipeline_info.stage.module = module;
+  pipeline_info.stage.pName = "main";
+  pipeline_info.layout = g.cas_pipeline_layout;
+  if (g.vk.vkCreateComputePipelines(g.device, VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &g.cas_pipeline) !=
+      VK_SUCCESS) {
+    g.cas_pipeline = {};
+    return false;
+  }
+  const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, State::kScreens},
+                                         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, State::kScreens}};
+  VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+  pool_info.maxSets = State::kScreens;
+  pool_info.poolSizeCount = 2;
+  pool_info.pPoolSizes = sizes;
+  g.vk.vkCreateDescriptorPool(g.device, &pool_info, nullptr, &g.cas_pool);
+  VkDescriptorSetLayout layouts[State::kScreens];
+  std::fill(std::begin(layouts), std::end(layouts), g.cas_set_layout);
+  VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+  allocate.descriptorPool = g.cas_pool;
+  allocate.descriptorSetCount = State::kScreens;
+  allocate.pSetLayouts = layouts;
+  return g.vk.vkAllocateDescriptorSets(g.device, &allocate, g.cas_sets) == VK_SUCCESS;
+}
+
 // The GPU thread: the screen images at the frame's size (the UNORM twin of the swapchain format), and the HUD's.
 bool MakeScreens(uint32_t width, uint32_t height, uint32_t hud_width, uint32_t hud_height) {
   if (g.screen_images[0] && g.screen_width == width && g.screen_height == height) {
@@ -641,6 +716,8 @@ bool MakeScreens(uint32_t width, uint32_t height, uint32_t hud_width, uint32_t h
     frame_lock.lock();
     WaitIdle();
     for (uint32_t i = 0; i < State::kScreens; ++i) {
+      g.vk.vkDestroyImageView(g.device, g.screen_views[i], nullptr);
+      g.screen_views[i] = {};
       g.vk.vkDestroyImage(g.device, g.screen_images[i], nullptr);
       g.vk.vkFreeMemory(g.device, g.screen_memory[i], nullptr);
       g.vk.vkDestroyImageView(g.device, g.hud_screen_views[i], nullptr);
@@ -652,6 +729,13 @@ bool MakeScreens(uint32_t width, uint32_t height, uint32_t hud_width, uint32_t h
       g.hud_screen_images[i] = {};
       g.hud_screen_memory[i] = {};
     }
+  }
+  if (g.scene_fixed) {
+    g.vk.vkDestroyImageView(g.device, g.scene_fixed_view, nullptr);
+    g.vk.vkDestroyImage(g.device, g.scene_fixed, nullptr);
+    g.vk.vkFreeMemory(g.device, g.scene_fixed_memory, nullptr);
+    g.scene_fixed = {};
+    g.scene_fixed_view = {};
   }
   if (g.hud_fixed) {
     g.vk.vkDestroyImageView(g.device, g.hud_fixed_view, nullptr);
@@ -665,13 +749,38 @@ bool MakeScreens(uint32_t width, uint32_t height, uint32_t hud_width, uint32_t h
     return false;
   }
   g.hud_fixed_view = MakeView(g.hud_fixed, VK_FORMAT_R8G8B8A8_UNORM);
+  // The sharpening pass (optional: without it the scene is copied as it is).
+  const bool cas = MakeCasPipeline() &&
+                   MakeTransferImage(width, height, g.scene_fixed, g.scene_fixed_memory, VK_FORMAT_R8G8B8A8_UNORM,
+                                     VK_IMAGE_USAGE_STORAGE_BIT);
+  if (cas) {
+    g.scene_fixed_view = MakeView(g.scene_fixed, VK_FORMAT_R8G8B8A8_UNORM);
+  }
   for (uint32_t i = 0; i < State::kScreens; ++i) {
-    if (!MakeTransferImage(width, height, g.screen_images[i], g.screen_memory[i]) ||
+    if (!MakeTransferImage(width, height, g.screen_images[i], g.screen_memory[i], VK_FORMAT_UNDEFINED,
+                           VK_IMAGE_USAGE_SAMPLED_BIT) ||
         !MakeTransferImage(hud_width, hud_height, g.hud_screen_images[i], g.hud_screen_memory[i],
                            VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_STORAGE_BIT)) {
       return false;
     }
     g.hud_screen_views[i] = MakeView(g.hud_screen_images[i], VK_FORMAT_R8G8B8A8_UNORM);
+    if (cas) {
+      g.screen_views[i] = MakeView(g.screen_images[i], UnormTwin(g.format));
+      const VkDescriptorImageInfo source{g.cas_sampler, g.screen_views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+      const VkDescriptorImageInfo target{VK_NULL_HANDLE, g.scene_fixed_view, VK_IMAGE_LAYOUT_GENERAL};
+      VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                                        {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+      writes[0].dstSet = writes[1].dstSet = g.cas_sets[i];
+      writes[0].dstBinding = 0;
+      writes[0].descriptorCount = 1;
+      writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+      writes[0].pImageInfo = &source;
+      writes[1].dstBinding = 1;
+      writes[1].descriptorCount = 1;
+      writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+      writes[1].pImageInfo = &target;
+      g.vk.vkUpdateDescriptorSets(g.device, 2, writes, 0, nullptr);
+    }
     VkDescriptorImageInfo images[2] = {{VK_NULL_HANDLE, g.hud_screen_views[i], VK_IMAGE_LAYOUT_GENERAL},
                                        {VK_NULL_HANDLE, g.hud_fixed_view, VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -1036,11 +1145,38 @@ bool Show(const State::Published& p) {
   copy.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   copy.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
   copy.extent = {g.width, g.height, 1};
-  g.vk.vkCmdCopyImage(cmd, g.screen_images[p.screen], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
-                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  // The scene sharpened per eye (as flat plume sharpens its frame), else copied as it is.
+  const float sharpening = g.scene_sharpening.load(std::memory_order_relaxed);
+  VkImage shown_scene = g.screen_images[p.screen];  // what reached the swapchain (the eye shot's source)
+  if (sharpening > 0.f && g.cas_pipeline && g.scene_fixed && g.screen_views[p.screen] && g.width == g.screen_width &&
+      g.height == g.screen_height) {
+    shown_scene = g.scene_fixed;
+    const VkImage screen = g.screen_images[p.screen];
+    Barrier(cmd, screen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    Barrier(cmd, g.scene_fixed, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_ACCESS_SHADER_WRITE_BIT);
+    g.vk.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.cas_pipeline);
+    g.vk.vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.cas_pipeline_layout, 0, 1,
+                                 &g.cas_sets[p.screen], 0, nullptr);
+    uint32_t constants[5] = {g.width, g.height, uint32_t(UnormTwin(g.format) == VK_FORMAT_B8G8R8A8_UNORM),
+                             g.width / (Stereo() ? 2u : 1u), 0};
+    std::memcpy(&constants[4], &sharpening, sizeof(float));
+    g.vk.vkCmdPushConstants(cmd, g.cas_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+    g.vk.vkCmdDispatch(cmd, (g.width + 7) / 8, (g.height + 7) / 8, 1);
+    Barrier(cmd, g.scene_fixed, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    Barrier(cmd, screen, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    g.vk.vkCmdCopyImage(cmd, g.scene_fixed, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  } else {
+    g.vk.vkCmdCopyImage(cmd, g.screen_images[p.screen], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, target,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  }
   Barrier(cmd, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
           VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT);
-  EyeShot shot = StartEyeShot(cmd, g.screen_images[p.screen], g.width, g.height);  // VR fork, development
+  EyeShot shot = StartEyeShot(cmd, shown_scene, g.width, g.height);  // VR fork, development
   if (p.hud && (g.hud_width == p.width && g.hud_height == p.height ? true : CreateHudSwapchain(p.width, p.height))) {
     uint32_t hud_index = 0;
     {
@@ -1559,6 +1695,10 @@ int SplitFrame(uint32_t width, uint32_t height, float aspect) {
 }
 
 void HudCaptured() { g.split_hud_captured = true; }
+
+void SetSceneSharpening(float strength) {
+  g.scene_sharpening.store(strength > 0.f ? std::min(strength, 1.f) : 0.f, std::memory_order_relaxed);
+}
 
 void SetFrameHasScene(bool has_scene) { g.frame_has_scene = has_scene; }
 

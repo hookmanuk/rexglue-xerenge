@@ -62,6 +62,10 @@ int SplitFrame(uint32_t width, uint32_t height, float aspect);
 /// The GPU thread: the split frame's HUD copy (kCopyHud) is recorded.
 void HudCaptured();
 
+// The scene's sharpening in the headset (0 off, to 1): plume's CAS per eye, as flat plume sharpens its frame (its own
+// pass reads one layer and is skipped in stereo). Any thread; applied from the next frame shown.
+void SetSceneSharpening(float strength);
+
 /// RecordFrameCopy's kinds: the guest output; a render target holding the scene (each eye to its half); a render
 /// target holding the HUD over transparent black (the left eye's, to the HUD image).
 /// Or'ed in: the render target is drawn at a resolution scale in x (y): its first column (row) filled from the next.

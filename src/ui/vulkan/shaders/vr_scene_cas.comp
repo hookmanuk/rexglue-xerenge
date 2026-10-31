@@ -1,0 +1,58 @@
+#version 450
+// VR fork: plume's sharpening (cas.frag, after AMD FidelityFX CAS, MIT licence, Copyright (c) 2019 Advanced Micro
+// Devices, Inc.) for the headset's scene: both eyes side by side in one image, each sharpened within its own half (a
+// neighbour past the eye's edge is the edge's pixel). Flat plume sharpens its finished frame; in stereo its pass was
+// skipped (it reads one layer). Into an RGBA8 image copied bit for bit into the swapchain image (channels swapped for
+// a BGRA one).
+// glslangValidator -V --target-env vulkan1.1 -x -o vr_scene_cas.inc vr_scene_cas.comp
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D source;
+layout(binding = 1, rgba8) uniform writeonly image2D target;
+layout(push_constant) uniform Constants {
+  uvec2 size;
+  uint swap_red_blue;
+  uint eye_width;
+  float sharpness;
+} constants;
+
+ivec2 g_lo, g_hi;
+
+vec3 Fetch(ivec2 p) {
+  return texelFetch(source, clamp(p, g_lo, g_hi), 0).rgb;
+}
+
+void main() {
+  const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (any(greaterThanEqual(uvec2(p), constants.size))) {
+    return;
+  }
+  const int eye_width = int(max(constants.eye_width, 1u));
+  const int eye = p.x / eye_width;
+  g_lo = ivec2(eye * eye_width, 0);
+  g_hi = ivec2(min((eye + 1) * eye_width, int(constants.size.x)) - 1, int(constants.size.y) - 1);
+  //  a b c
+  //  d e f
+  //  g h i
+  const vec3 a = Fetch(p + ivec2(-1, -1));
+  const vec3 b = Fetch(p + ivec2(0, -1));
+  const vec3 c = Fetch(p + ivec2(1, -1));
+  const vec3 d = Fetch(p + ivec2(-1, 0));
+  const vec4 centre = texelFetch(source, p, 0);
+  const vec3 e = centre.rgb;
+  const vec3 f = Fetch(p + ivec2(1, 0));
+  const vec3 g = Fetch(p + ivec2(-1, 1));
+  const vec3 h = Fetch(p + ivec2(0, 1));
+  const vec3 i = Fetch(p + ivec2(1, 1));
+  vec3 mn = min(min(min(d, e), min(f, b)), h);
+  const vec3 mn2 = min(min(min(mn, a), c), min(g, i));
+  mn += mn2;
+  vec3 mx = max(max(max(d, e), max(f, b)), h);
+  const vec3 mx2 = max(max(max(mx, a), c), max(g, i));
+  mx += mx2;
+  const vec3 amp = sqrt(clamp(min(mn, 2.0 - mx) / max(mx, vec3(1e-4)), 0.0, 1.0));
+  const float peak = -1.0 / mix(8.0, 5.0, clamp(constants.sharpness, 0.0, 1.0));
+  const vec3 w = amp * peak;
+  const vec3 sharpened = (b * w + d * w + f * w + h * w + e) / (1.0 + 4.0 * w);
+  const vec4 result = vec4(clamp(sharpened, 0.0, 1.0), centre.a);
+  imageStore(target, p, constants.swap_red_blue != 0u ? result.bgra : result);
+}
