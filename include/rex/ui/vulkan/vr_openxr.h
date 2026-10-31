@@ -166,5 +166,9 @@ void SetScreenAspect(float aspect);
 /// measures from it how long a pose takes to be seen, and HeadPoseNow looks that far ahead.
 std::chrono::steady_clock::time_point CameraPoseTime();
 void SetPresentPoseTime(std::chrono::steady_clock::time_point taken);
+/// The game's thread, at the frame's camera read: the camera of its logic state and the camera it is drawn with (moved
+/// between logic steps), rows right, up, at, position; the renderer takes them with the frame (TakeFrameCameras).
+void NoteFrameCameras(const float (&logic)[12], const float (&drawn)[12]);
+bool TakeFrameCameras(float (&logic)[12], float (&drawn)[12]);
 
 }  // namespace rex::ui::vulkan::vr

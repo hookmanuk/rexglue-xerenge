@@ -2174,6 +2174,28 @@ bool TakeCameraPose(float (&pose)[16], float (&tangents)[4]) {
   return true;
 }
 
+namespace {
+std::mutex g_frame_cameras_mutex;
+bool g_frame_cameras = false;
+float g_logic_camera[12], g_drawn_camera[12];
+}  // namespace
+
+void NoteFrameCameras(const float (&logic)[12], const float (&drawn)[12]) {
+  std::scoped_lock lock{g_frame_cameras_mutex};
+  std::memcpy(g_logic_camera, logic, sizeof(g_logic_camera));
+  std::memcpy(g_drawn_camera, drawn, sizeof(g_drawn_camera));
+  g_frame_cameras = true;
+}
+
+bool TakeFrameCameras(float (&logic)[12], float (&drawn)[12]) {
+  std::scoped_lock lock{g_frame_cameras_mutex};
+  std::memcpy(logic, g_logic_camera, sizeof(logic));
+  std::memcpy(drawn, g_drawn_camera, sizeof(drawn));
+  const bool had = g_frame_cameras;
+  g_frame_cameras = false;
+  return had;
+}
+
 void SetPresentPoseTime(std::chrono::steady_clock::time_point taken) {
   std::scoped_lock lock{g.pose_mutex};
   g.gpu_pose.pose_time = taken;
