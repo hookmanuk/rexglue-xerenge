@@ -1253,15 +1253,21 @@ bool Show(const State::Published& p) {
 }
 
 void EndFrame() {
-  // The screen: 3 m wide, 2.5 m ahead of the seat, at eye height, the picture's aspect.
+  // The screen: 3 m wide, 2.5 m ahead of the seat (the recentred reference: Start and F8 move it to the head, as they
+  // do the game's view and the HUD; Matt 2026-10-31: in the splash screens and menus Start did not), the picture's
+  // aspect.
   XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
   quad.space = g.local_space;
   quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
   quad.subImage.swapchain = g.swapchain;
   const uint32_t eye_width = g.width / (Stereo() ? 2 : 1);
   quad.subImage.imageRect = {{0, 0}, {int32_t(eye_width), int32_t(g.height)}};
-  quad.pose.orientation.w = 1.f;
-  quad.pose.position = {0.f, 0.f, -2.5f};
+  {
+    const float yaw = g.have_reference ? g.reference_yaw : 0.f, cy = std::cos(yaw), sy = std::sin(yaw);
+    const XrVector3f origin = g.have_reference ? g.reference_position : XrVector3f{0.f, 0.f, 0.f};
+    quad.pose.orientation = {0.f, std::sin(yaw * 0.5f), 0.f, std::cos(yaw * 0.5f)};
+    quad.pose.position = {origin.x - sy * 2.5f, origin.y, origin.z - cy * 2.5f};
+  }
   // The game's own aspect: the picture's pixels are not square (the eyes are drawn taller than the output).
   quad.size = {3.f, 3.f * g.hud_aspect.load(std::memory_order_relaxed)};
   const XrCompositionLayerBaseHeader* layers[1] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&quad)};
