@@ -155,5 +155,8 @@ bool DrawnPose(float (&pose)[16]);
 /// The head pose for the game's next frame: rows of the head's x, y, z axes and its position in the seat's space
 /// (row vectors), and the eyes' field of view (tangents left, right, up, down). False before the first tracked frame.
 bool HeadPose(float (&pose)[16], float (&tangents)[4]);
+/// As HeadPose, carried on to now from the headset loop's last two poses: a game whose frames don't fall one to a
+/// headset frame (60 Hz logic steps in some) gets a new pose for each.
+bool HeadPoseNow(float (&pose)[16], float (&tangents)[4]);
 
 }  // namespace rex::ui::vulkan::vr

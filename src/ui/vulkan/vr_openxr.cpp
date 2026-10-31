@@ -296,6 +296,10 @@ struct State {
   bool head_valid = false;
   float head_pose[16]{};
   float head_tangents[4]{};
+  // The one before and when each was taken (HeadPoseNow).
+  float previous_head_pose[16]{};
+  bool previous_head_valid = false;
+  std::chrono::steady_clock::time_point head_time{}, previous_head_time{};
   float ipd = 0.064f;
   std::atomic<float> eye_shift{0.f};  // the left eye's clip-space shift (EyeShift)
 
@@ -936,6 +940,10 @@ void UpdateHead() {
   }
   PoseTrace("0 UpdateHead", pose);
   std::scoped_lock lock{g.head_mutex};
+  std::memcpy(g.previous_head_pose, g.head_pose, sizeof(pose));
+  g.previous_head_valid = g.head_valid;
+  g.previous_head_time = g.head_time;
+  g.head_time = std::chrono::steady_clock::now();
   std::memcpy(g.head_pose, pose, sizeof(pose));
   std::memcpy(g.head_tangents, tangents, sizeof(tangents));
   g.head_valid = true;
@@ -2220,6 +2228,45 @@ bool HeadPose(float (&pose)[16], float (&tangents)[4]) {
   std::memcpy(pose, g.head_pose, sizeof(pose));
   PoseTrace("1 camera HeadPose", pose);
   std::memcpy(tangents, g.head_tangents, sizeof(tangents));
+  return true;
+}
+
+bool HeadPoseNow(float (&pose)[16], float (&tangents)[4]) {
+  std::scoped_lock lock{g.head_mutex};
+  if (!g.head_valid) {
+    return false;
+  }
+  std::memcpy(pose, g.head_pose, sizeof(pose));
+  std::memcpy(tangents, g.head_tangents, sizeof(tangents));
+  const double step = std::chrono::duration<double>(g.head_time - g.previous_head_time).count();
+  if (!g.previous_head_valid || step <= 0.0 || step > 0.05) {
+    return true;
+  }
+  // Carried on by the time since the newer pose (the last two's change per their interval), at most one and a half
+  // intervals; the axes made orthonormal again.
+  const float f = float(std::clamp(
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - g.head_time).count() / step, 0.0, 1.5));
+  for (int i = 0; i < 16; ++i) {
+    pose[i] = g.head_pose[i] + (g.head_pose[i] - g.previous_head_pose[i]) * f;
+  }
+  auto dot = [&](int a, int b) { return pose[a] * pose[b] + pose[a + 1] * pose[b + 1] + pose[a + 2] * pose[b + 2]; };
+  auto normalize = [&](int a) {
+    const float l = std::sqrt(dot(a, a));
+    for (int k = 0; k < 3 && l > 1e-6f; ++k) {
+      pose[a + k] /= l;
+    }
+  };
+  normalize(8);
+  const float zy = dot(4, 8);
+  for (int k = 0; k < 3; ++k) {
+    pose[4 + k] -= zy * pose[8 + k];
+  }
+  normalize(4);
+  const float zx = dot(0, 8), yx = dot(0, 4);
+  for (int k = 0; k < 3; ++k) {
+    pose[k] -= zx * pose[8 + k] + yx * pose[4 + k];
+  }
+  normalize(0);
   return true;
 }
 
