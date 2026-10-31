@@ -233,6 +233,7 @@ struct State {
     bool posed = false;  // rendered with a head pose: shown as a projection layer at it, not on the screen
     bool hud = false;    // split: the HUD in hud_screen_images[screen], the scene alone in the screen
     float pose[16]{}, tangents[4]{};
+    std::chrono::steady_clock::time_point pose_time{};  // when its pose was taken (HeadPoseNow at the camera read)
     uint32_t screen = 0, width = 0, height = 0;
     uint32_t out_width = 0, out_height = 0;  // an eye in the headset's swapchain (dlss::OutputSize)
     uint64_t tick = 0;
@@ -279,6 +280,7 @@ struct State {
   struct SwapPose {
     bool posed;
     float pose[16], tangents[4];
+    std::chrono::steady_clock::time_point pose_time{};
     uint32_t frontbuffer = 0;  // the physical address its swap packet presents
   };
   std::deque<SwapPose> swap_poses;
@@ -288,6 +290,7 @@ struct State {
   std::mutex camera_mutex;
   bool camera_posed = false;
   float camera_pose[16]{}, camera_tangents[4]{};
+  std::chrono::steady_clock::time_point camera_time{};
   bool drawn_posed = false;
   float drawn_pose[16]{}, drawn_tangents[4]{};
 
@@ -297,6 +300,9 @@ struct State {
   float head_pose[16]{};
   float head_tangents[4]{};
   // The one before and when each was taken (HeadPoseNow).
+  // From a frame's pose being taken to the start of the headset frame that shows it (Show), smoothed: HeadPoseNow
+  // carries the pose on by it, so a frame is drawn at the head's pose when it is seen.
+  std::atomic<int64_t> pose_latency_ns{0};
   float previous_head_pose[16]{};
   bool previous_head_valid = false;
   std::chrono::steady_clock::time_point head_time{}, previous_head_time{};
@@ -1369,6 +1375,33 @@ void PhaseLockGame(std::chrono::steady_clock::duration waited) {
   g.pace_shift_ns.fetch_add(shift, std::memory_order_relaxed);
 }
 
+// A shown frame's pose against the headset frame showing it (HeadPoseNow's look-ahead). MCLA_VR_SHOWLOG: each one.
+void NotePoseLatency(const State::Published& p, std::chrono::steady_clock::time_point slot_start) {
+  const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(slot_start - p.pose_time).count();
+  if (!p.posed || p.pose_time == std::chrono::steady_clock::time_point{} || ns <= 0 || ns > 200'000'000) {
+    if (static int told = 0; told < 6) {  // development
+      ++told;
+      Log("show: no look-ahead measure (posed %d, pose time %s, %.1f ms)", int(p.posed),
+          p.pose_time == std::chrono::steady_clock::time_point{} ? "unset" : "set", ns * 1e-6);
+    }
+    return;
+  }
+  const int64_t was = g.pose_latency_ns.load(std::memory_order_relaxed);
+  g.pose_latency_ns.store(was ? was + (ns - was) / 16 : ns, std::memory_order_relaxed);
+  static const bool log = std::getenv("MCLA_VR_SHOWLOG") != nullptr;  // development
+  if (log) {
+    Log("show: slot at %lld us, pose taken %.2f ms before, yaw %.3f, latency %.2f ms",
+        (long long)std::chrono::duration_cast<std::chrono::microseconds>(slot_start.time_since_epoch()).count(),
+        ns * 1e-6, std::atan2(-p.pose[8], p.pose[10]) * 57.29578, g.pose_latency_ns.load() * 1e-6);
+  }
+  static auto since = std::chrono::steady_clock::now();
+  if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+    since = std::chrono::steady_clock::now();
+    Log("a frame's pose taken %.1f ms before the headset frame showing it (carried on by that)",
+        g.pose_latency_ns.load() * 1e-6);
+  }
+}
+
 void WaitForGameFrame() {
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
   uint64_t next_tick = 0;
@@ -1482,6 +1515,7 @@ void FrameLoop() {
       if (i + 1 < recent.size() && Finished(p)) {  // the newest done (the oldest kept may be refilled: not it)
         g.shown_serial = p.serial;
         shown = Show(p);
+        NotePoseLatency(p, slot_start);
         break;
       }
     }
@@ -1774,6 +1808,7 @@ int BeginFrame(uint32_t width, uint32_t height) {
   g.pending.posed = g.gpu_pose.posed && g.frame_has_scene;  // 2D only (a title screen): on the screen
   std::memcpy(g.pending.pose, g.gpu_pose.pose, sizeof(g.pending.pose));
   std::memcpy(g.pending.tangents, g.gpu_pose.tangents, sizeof(g.pending.tangents));
+  g.pending.pose_time = g.gpu_pose.pose_time;
   g.pending.screen = index;
   g.pending.width = width;
   g.pending.height = height;
@@ -2064,6 +2099,7 @@ void NoteCameraPose(const float (&pose)[16], const float (&tangents)[4]) {
   std::memcpy(g.camera_pose, pose, sizeof(g.camera_pose));
   std::memcpy(g.camera_tangents, tangents, sizeof(g.camera_tangents));
   g.camera_posed = true;
+  g.camera_time = std::chrono::steady_clock::now();
 }
 
 void SceneDrawStarted() {
@@ -2136,6 +2172,16 @@ bool TakeCameraPose(float (&pose)[16], float (&tangents)[4]) {
   std::memcpy(tangents, g.camera_tangents, sizeof(tangents));
   g.camera_posed = false;
   return true;
+}
+
+void SetPresentPoseTime(std::chrono::steady_clock::time_point taken) {
+  std::scoped_lock lock{g.pose_mutex};
+  g.gpu_pose.pose_time = taken;
+}
+
+std::chrono::steady_clock::time_point CameraPoseTime() {
+  std::scoped_lock lock{g.camera_mutex};
+  return g.camera_time;
 }
 
 void SetPresentPose(bool posed, const float (&pose)[16], const float (&tangents)[4]) {
@@ -2248,10 +2294,14 @@ bool HeadPoseNow(float (&pose)[16], float (&tangents)[4]) {
   if (!g.previous_head_valid || step <= 0.0 || step > 0.05) {
     return true;
   }
-  // Carried on by the time since the newer pose (the last two's change per their interval), at most one and a half
-  // intervals; the axes made orthonormal again.
+  // Carried on by the time since the newer pose and on to when the frame will be seen (pose_latency_ns: the newer pose
+  // is the headset frame's now, the frame is shown that much later), by the last two's change per their interval, at
+  // most eight intervals; the axes made orthonormal again. MCLA_VR_PREDICT=0: to now only.
+  static const bool predict = !(std::getenv("MCLA_VR_PREDICT") && std::getenv("MCLA_VR_PREDICT")[0] == '0');
+  const double ahead = predict ? double(g.pose_latency_ns.load(std::memory_order_relaxed)) * 1e-9 : 0.0;
   const float f = float(std::clamp(
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - g.head_time).count() / step, 0.0, 1.5));
+      (std::chrono::duration<double>(std::chrono::steady_clock::now() - g.head_time).count() + ahead) / step, 0.0,
+      8.0));
   for (int i = 0; i < 16; ++i) {
     pose[i] = g.head_pose[i] + (g.head_pose[i] - g.previous_head_pose[i]) * f;
   }

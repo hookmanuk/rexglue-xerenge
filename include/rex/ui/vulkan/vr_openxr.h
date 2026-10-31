@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <vector>
 
@@ -161,5 +162,9 @@ bool HeadPoseNow(float (&pose)[16], float (&tangents)[4]);
 /// The renderer's frame shape (height over width) for the screens shown flat (title, menus) and the HUD sheet; the
 /// default is 9/16, the console's output.
 void SetScreenAspect(float aspect);
+/// When the camera's pose (NoteCameraPose) was noted, and the presented frame's (SetPresentPose's) was: the headset
+/// measures from it how long a pose takes to be seen, and HeadPoseNow looks that far ahead.
+std::chrono::steady_clock::time_point CameraPoseTime();
+void SetPresentPoseTime(std::chrono::steady_clock::time_point taken);
 
 }  // namespace rex::ui::vulkan::vr
