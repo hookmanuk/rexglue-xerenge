@@ -284,6 +284,8 @@ bool PadFileState(X_INPUT_GAMEPAD& pad) {
       if (name == "ly") pad.thumb_ly = axis;
       if (name == "rx") pad.thumb_rx = axis;
       if (name == "ry") pad.thumb_ry = axis;
+      if (name == "lt") pad.left_trigger = uint8_t(std::max(v, 0.f) * 255.f);  // partly pressed: lt=0.4
+      if (name == "rt") pad.right_trigger = uint8_t(std::max(v, 0.f) * 255.f);
     }
   }
   pad.buttons = uint16_t(uint16_t(pad.buttons) | buttons);
